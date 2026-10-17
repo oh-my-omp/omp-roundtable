@@ -19,8 +19,8 @@ type ToolResponse=Result<ControllerOutput,RuntimeError|{kind:'parse';error:Parse
 /** Read once per process: `absent` stays inert, `invalid` reports once, `coordinator` is the fixed role. */
 type Identity={kind:'absent'}|{kind:'invalid';message:string}|({kind:'coordinator'}&CoordinatorIdentity);
 
-function requireText(value:unknown):void {if(typeof value!=='string'||value.trim().length===0)throw new Error('Roundtable setting must be a nonempty string');}
-function requireInterval(value:unknown):void {if(typeof value!=='number'||!Number.isSafeInteger(value)||value<1||value>2_147_483)throw new Error('Roundtable recompute interval must be a positive safe whole number of seconds within the native timer range');}
+function requireText(value:unknown):void {if(value===undefined)return;if(typeof value!=='string'||value.trim().length===0)throw new Error('Roundtable setting must be a nonempty string');}
+function requireInterval(value:unknown):void {if(value===undefined)return;if(typeof value!=='number'||!Number.isSafeInteger(value)||value<1||value>2_147_483)throw new Error('Roundtable recompute interval must be a positive safe whole number of seconds within the native timer range');}
 function errorText(error:RuntimeError):string {return JSON.stringify(error);}
 
 /** Native reevaluates module graphs per seat; this object lives in the process slot. */
