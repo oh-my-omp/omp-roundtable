@@ -405,7 +405,8 @@ export async function startFakeGh(options: {routes: FakeGhRoute[]}): Promise<Fak
 
 function readRequests(log: string): FakeGhRequest[] {
   return readFileSync(log, 'utf8').split('\n').filter(line => line.length > 0).map((line, index) => {
-    const parsed = requestSchema.safeParse(JSON.parse(line) as unknown);
+    const entry: unknown = JSON.parse(line);
+    const parsed = requestSchema.safeParse(entry);
     if (!parsed.success) throw new Error(`Fake gh log line ${index + 1} is not a request: ${describe(parsed.error)}`);
     return parsed.data;
   });
@@ -428,7 +429,8 @@ function queryOf(payload: string): string | null {
 }
 
 function readRoutes(scenario: string): FakeGhRoute[] {
-  const parsed = z.object({routes: z.array(routeSchema)}).safeParse(JSON.parse(readFileSync(scenario, 'utf8')) as unknown);
+  const entry: unknown = JSON.parse(readFileSync(scenario, 'utf8'));
+  const parsed = z.object({routes: z.array(routeSchema)}).safeParse(entry);
   if (!parsed.success) throw new Error(`Fake gh scenario is not a route table: ${describe(parsed.error)}`);
   return parsed.data.routes;
 }
