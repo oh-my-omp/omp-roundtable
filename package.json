@@ -12,7 +12,8 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "sim": "bun tests/sim/run.ts"
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "^18.11.1",
