@@ -94,7 +94,10 @@ test('one launch per ticket: the relay seats every later stage at its exact comm
     ]})).ok).toBe(true);
     expect(h.wakes).toEqual([['launch:A']]);
 
-    const launched=await h.asMain({op:'launch',ticketId:'A'});
+    // A named role must be one the ticket's current stage offers; a rejected launch leaves the ticket off the table.
+    expect(await h.asMain({op:'launch',ticketId:'A',role:'review'})).toMatchObject({ok:false,error:{error:{kind:'invalidTransition'}}});
+    expect(h.launches).toHaveLength(0);
+    const launched=await h.asMain({op:'launch',ticketId:'A',role:'owner'});
     expect(launched).toMatchObject({ok:true,value:{launched:[{jobId:'job-1'}]}});
     expect(h.launches[0]).toMatchObject({ticketId:'A',role:'owner',workspace:{kind:'base',target}});
     expect(await h.asMain({op:'launch',ticketId:'A'})).toMatchObject({ok:false,error:{error:{kind:'invalidTransition'}}});

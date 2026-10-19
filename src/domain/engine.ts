@@ -50,9 +50,9 @@ export function availableRoles(state:Agenda,ticket:Ticket):Role[] {
     case 'Publishing':case 'Merging':case 'Escalated':case 'Done':return [];
   }
 }
-/** A ticket Main may put on the table: never launched, not awaiting a ruling, and every dependency Done. */
+/** A Coding ticket Main has not put on the table yet, whose dependencies are all Done. */
 export function awaitsLaunch(state:Agenda,ticket:Ticket):boolean {
-  return !ticket.started&&ticket.state!=='Escalated'&&ticket.state!=='Done'&&dependenciesDone(state,ticket);
+  return ticket.state==='Coding'&&!ticket.started&&dependenciesDone(state,ticket);
 }
 export function gateStamp(state:Agenda,ticket:Ticket,role:Exclude<GateKind,'closure'>,facts:Facts):GateStamp|null {
   const issue=facts.issues.find(issue=>sameRef(issue.ref,ticket.issue));
@@ -296,6 +296,8 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
     if(ticket.started)return reject('invalidTransition','This ticket is already on the table; the roundtable relays its seats until it is Done or Escalated');
     if(ticket.state==='Escalated'||ticket.state==='Done')return reject('invalidTransition','Resolve an Escalated ticket before launching it; a Done ticket needs no seat');
     if(!dependenciesDone(next,ticket))return reject('invalidTransition','Every dependency must be Done before this ticket is launched');
+    // The optional role only names a seat the ticket's current stage already offers; every such seat starts either way.
+    if(operation.role&&!availableRoles(next,ticket).includes(operation.role))return reject('invalidTransition',`This ticket's current stage does not offer a ${operation.role} seat`);
     ticket.started=true;next.version++;return {ok:true,value:next};
   }
   if(!('revision' in operation)||operation.revision!==(ticket?.revision??closure?.revision))return reject('staleRevision',caller.kind==='seat'?'This seat revision has been superseded. Exit; the roundtable relays a fresh seat.':'Read the current ticket revision');
