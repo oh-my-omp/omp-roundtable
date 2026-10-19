@@ -13,7 +13,7 @@ const issue={repo:repository,number:1};
 const head='1'.repeat(40),base='2'.repeat(40);
 const facts:Facts={viewer:'test',issues:[{ref:issue,body:'Deliver the ticket.',bodyHash:bodyHash('Deliver the ticket.'),updatedAt:1,state:'open',lastClose:null,lastReopen:null,children:[]}],prs:[],links:[],repos:[{repo:repository,defaultBranch:'main',defaultHead:base,bases:[{name:'main',state:{kind:'present',head:base,isDefault:true,rules:{required:[],strict:false,constraints:[]}}}]}],branches:[{repo:repository,name:'feature',state:{kind:'present',head}}],maintenance:[],commits:[],checkAttempts:[],createdIssues:[]};
 function unexpected():never {throw new Error('Unexpected port call');}
-const host:HostPort={bind:unexpected,launch:unexpected,active:()=>false,finish:async()=>({ok:true,value:null}),dispose:async()=>{}};
+const host:HostPort={bind:unexpected,launch:unexpected,active:()=>false,seated:()=>false,finish:async()=>({ok:true,value:null}),dispose:async()=>{}};
 function success<T>(value:T):Result<T,PortError>{return {ok:true,value};}
 
 for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operation} is durable before dispatch and is not resent on refresh or resume`,async()=>{

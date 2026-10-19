@@ -178,9 +178,11 @@ export class RoundtableController {
   }
   /**
    * Seats follow from ticket state alone: every started ticket and the parent closure receive their due seats
-   * without Main. A seat waits for any live seat of its own role (a superseded revision ends at its next tool
-   * boundary); an Owner waits for every seat of its ticket, so a rework fork copies a complete, flushed transcript
-   * and owns the checkout alone.
+   * without Main. A seat is one-shot per revision: once a role has been seated at a revision it is never seated
+   * there again, so a seat that ended without a handoff waits for its escalation instead of being replaced.
+   * A seat also waits for any live seat of its own role (a superseded revision ends at its next tool boundary);
+   * an Owner waits for every seat of its ticket, so a rework fork copies a complete, flushed transcript and owns
+   * the checkout alone.
    */
   private async relay():Promise<Result<SeatHandle[],RuntimeError>> {
     const launched:SeatHandle[]=[],host=this.options.host;
@@ -188,11 +190,13 @@ export class RoundtableController {
     const due:{ticketId:string;role:Role}[]=[];
     for(const ticket of this.state.tickets){
       if(!ticket.started)continue;
-      for(const role of availableRoles(this.state,ticket))
+      for(const role of availableRoles(this.state,ticket)){
+        if(host.seated(ticket.id,role,ticket.revision))continue;
         if(role==='owner'?!SEAT_ROLES.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
+      }
     }
     const closure=this.state.closure;
-    if(closure?.state==='Reviewing'&&closure.gate.status==='pending'&&!host.active(closure.id,'closure'))due.push({ticketId:closure.id,role:'closure'});
+    if(closure?.state==='Reviewing'&&closure.gate.status==='pending'&&!host.seated(closure.id,'closure',closure.revision)&&!host.active(closure.id,'closure'))due.push({ticketId:closure.id,role:'closure'});
     for(const {ticketId,role} of due){
       // An earlier failed launch may have escalated this ticket.
       const input=this.seatLaunch(ticketId,role);if(!input)continue;

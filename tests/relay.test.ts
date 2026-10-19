@@ -53,6 +53,7 @@ function harness(root:string) {
   const live=new Map<string,SeatLaunch>(),launches:SeatLaunch[]=[];
   const host:HostPort={bind:unexpected,finish:async()=>success(null),dispose:async()=>{},
     active:(ticketId,role)=>live.has(`${ticketId}/${role}`),
+    seated:(ticketId,role,revision)=>launches.some(seat=>seat.ticketId===ticketId&&seat.role===role&&seat.revision===revision),
     launch:async input=>{launches.push(input);live.set(`${input.ticketId}/${input.role}`,input);return success({agentId:`${input.role}-${launches.length}`,sessionFile:join(root,`${input.role}-${launches.length}.jsonl`),jobId:`job-${launches.length}`});},
   };
   const attention=new Attention(),wakes:string[][]=[],errors:unknown[]=[];
@@ -182,5 +183,21 @@ test('a seat that exits without a handoff escalates its current revision instead
     expect((await h.asMain({op:'resolve',ticketId:'A',revision:2,ruling:'Retry the implementation.',to:'Coding'})).ok).toBe(true);
     await h.drain();
     expect(h.launches[1]).toMatchObject({role:'owner',revision:3,workspace:{kind:'base',target}});
+  }finally {await h.controller.shutdown();await rm(root,{recursive:true,force:true});}
+});
+
+test('a seat that ends without a handoff while a refresh is in flight is not re-seated at its revision',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'roundtable-reseat-'));
+  const h=harness(root);
+  try {
+    expect((await h.asMain({op:'convene',parent:null,tickets:[{id:'A',issue:issueA,target,dependsOn:[],adoptPr:null}]})).ok).toBe(true);
+    expect((await h.asMain({op:'launch',ticketId:'A'})).ok).toBe(true);
+    // The refresh is already reading the source when the Owner leaves; its escalation queues behind the refresh.
+    const refresh=h.controller.run();
+    h.exit('A','owner',false,'model stopped');
+    await refresh;
+    await h.drain();
+    expect(h.launches.filter(seat=>seat.ticketId==='A'&&seat.role==='owner').map(seat=>seat.revision)).toEqual([1]);
+    expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'Escalated',revision:2});
   }finally {await h.controller.shutdown();await rm(root,{recursive:true,force:true});}
 });

@@ -30,6 +30,9 @@ async function git(args:readonly string[]):Promise<string>{const {stdout}=await 
 export function createHostPort(options:HostOptions):HostPort {
   const registry=AgentRegistry.global();
   const seats=new Map<string,LiveSeat>();
+  // Every (ticket, role, revision) this host has seated, live or ended. A seat that ends without a handoff
+  // is escalated asynchronously; until then its revision must not be seated again.
+  const seatedRevisions=new Set<string>();
   const reposDir=join(options.dataDir,'repos'),worktreesDir=join(options.dataDir,'worktrees'),sessionsDir=join(options.dataDir,'sessions');
   // git holds ref and worktree-admin locks per repository, so every operation on one bare cache runs in order.
   const locks=new Map<string,Promise<unknown>>();
@@ -84,12 +87,14 @@ export function createHostPort(options:HostOptions):HostPort {
       return {ok:true,value:{kind:'seat',agentId:ref.id,sessionId:ctx.sessionManager.getSessionId(),sessionFile:file,ticketId:seat.input.ticketId,revision:seat.input.revision,role:seat.input.role}};
     },
     active(ticketId,role){return [...seats.values()].some(seat=>seat.input.ticketId===ticketId&&seat.input.role===role);},
+    seated(ticketId,role,revision){return seatedRevisions.has(JSON.stringify([ticketId,role,revision]));},
     async launch(input){
       if(disposed)return {ok:false,error:{kind:'precondition',message:'Seat host has shut down'}};
       if([...seats.values()].some(seat=>seat.input.ticketId===input.ticketId&&seat.input.role===input.role))return {ok:false,error:{kind:'precondition',message:'Ticket role already has a live session'}};
       const id=`Rt${randomUUID().replaceAll('-','')}`;
       // This is a lifecycle reservation, not an observation of a native session.
       const seat:LiveSeat={input,session:null,done:Promise.resolve()};seats.set(id,seat);
+      seatedRevisions.add(JSON.stringify([input.ticketId,input.role,input.revision]));
       let manager:SessionManager|undefined,tree:Worktree|null=null;
       const fork=input.workspace.kind==='fork'?input.workspace.sessionFile:null;
       try {

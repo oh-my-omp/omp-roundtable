@@ -38,6 +38,8 @@ export interface HostPort {
   bind(ctx:ExtensionContext):Result<Caller,PortError>;
   launch(input:SeatLaunch):Promise<Result<SeatHandle,PortError>>;
   active(ticketId:string,role:Role):boolean;
+  /** Whether this host has started a seat for exactly this ticket, role and revision; a seat is one-shot per revision. */
+  seated(ticketId:string,role:Role,revision:number):boolean;
   finish(agendaId:string):Promise<Result<null,PortError>>;
   dispose():Promise<void>;
 }
