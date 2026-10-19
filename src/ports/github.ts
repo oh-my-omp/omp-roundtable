@@ -154,7 +154,7 @@ function requirements(value: z.infer<typeof sourceBranch>): m.MergeRequirements 
       strict ||= strictPolicy;
     }
   }
-  return { required, strict, upToDate: strict, constraints: constraints.sort() };
+  return { required, strict, constraints: constraints.sort() };
 }
 function checks(value: SourcePr, rules: m.MergeRequirements): m.ChecksSnapshot {
   const rollup = value.statusCheckRollup;
@@ -460,7 +460,9 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
       const prRef = ref(source);
       const snapshot: m.PrSnapshot = { ref: prRef, headRepo, headBranch: source.headRefName, head: source.headRefOid, target: { repo: targetRepo, base: source.baseRefName }, title: source.title, body: source.body, bodyHash: digest(source.body), updatedAt: source.updatedAt,
         state: source.state === 'MERGED' ? decode(m.prStateSchema, { kind: 'merged', sha: source.mergeCommit?.oid, at: source.mergedAt }, 'merged PR') : { kind: source.state === 'OPEN' ? 'open' : 'closed' },
-        closes: source.closingIssuesReferences.nodes.map(ref), mergeable: source.mergeable === 'CONFLICTING' || source.mergeStateStatus === 'BEHIND' ? 'no' : source.mergeable === 'MERGEABLE' ? 'yes' : 'unknown', checks: rules ? checks(source, rules) : { kind: 'unknown', reason: 'Target base missing' },
+        closes: source.closingIssuesReferences.nodes.map(ref),
+        mergeable: source.mergeable === 'CONFLICTING' ? 'no' : source.mergeStateStatus === 'DRAFT' ? 'draft' : source.mergeStateStatus === 'BEHIND' ? 'behind' : source.mergeable === 'MERGEABLE' ? 'yes' : 'unknown',
+        checks: rules ? checks(source, rules) : { kind: 'unknown', reason: 'Target base missing' },
       };
       if (snapshot.checks.kind === 'failing') {
         for (const failure of snapshot.checks.required) if (failure.kind === 'actions') await verifyActionsFailure(prRef.repo, failure, cause);

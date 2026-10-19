@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import type {Agenda,Caller,DomainError,Effect,EffectResult,Facts,PortError,PortInput,Result,Role} from '../domain/model.ts';
 import {applyOperation,availableRoles,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
-import {canonical} from '../domain/identity.ts';
+import {canonical,sameRef} from '../domain/identity.ts';
 import {seatBrief} from '../domain/briefs.ts';
 import type {AgendaFiles,GitHubPort,HostPort,StateError} from '../ports/contracts.ts';
 import {createSourceReader,type SourceReceipt} from './source.ts';
@@ -105,16 +105,21 @@ export class RoundtableController {
         const allowed=ticket?availableRoles(this.state,ticket).includes(operation.role):closure?.state==='Reviewing'&&closure.gate.status==='pending'&&operation.role==='closure';
         if(!allowed||!revision)return domain('invalidTransition','This ticket role is not actionable');
         if(this.options.host.active(operation.ticketId,operation.role))return domain('ownershipBlocked','This ticket role already has a live seat');
-        const launched=await this.options.host.launch({ticketId:operation.ticketId,revision,role:operation.role,agent:operation.role==='owner'?this.options.ownerAgent:this.options.gateAgent,cwd,
+        const launched=await this.options.host.launch({agendaId:this.state.id,ticketId:operation.ticketId,revision,role:operation.role,agent:operation.role==='owner'?this.options.ownerAgent:this.options.gateAgent,cwd,
           sourceSessionFile:operation.role==='owner'?ticket?.ownerSessionFile??null:null,prompt:seatBrief(this.state,operation.ticketId,operation.role),
           ticket:ticket??closure!,workspace:ticket?.target??this.state.tickets[0]!.target});
         if(!launched.ok)return {ok:false,error:{kind:'host',error:launched.error}};
         return {ok:true,value:{launched:launched.value}};
       }
+      if(operation.op==='finish'||operation.op==='resolve'&&operation.remove?.length){
+        const retiring=operation.op==='finish'?this.state.tickets:this.state.tickets.filter(ticket=>operation.remove?.includes(ticket.id));
+        const live=retiring.some(ticket=>(['owner','review','accept','postMerge'] as const).some(role=>this.options.host.active(ticket.id,role)));
+        if(live||operation.op==='finish'&&this.state.closure&&this.options.host.active(this.state.closure.id,'closure'))return domain('ownershipBlocked','Wait for retiring one-shot seat jobs to exit before finishing or removing their tickets');
+      }
       const changed=applyOperation(this.state,operation,caller,fresh.value,Date.now());if(!changed.ok)return {ok:false,error:{kind:'domain',error:changed.error}};
       const committed=await this.save(changed.value,this.state.version);if(!committed.ok)return committed;
       if(operation.op==='finish'){
-        const cleaned=await this.options.host.finish(this.state.tickets.flatMap(ticket=>ticket.ownerSessionFile?[ticket.ownerSessionFile]:[]));
+        const cleaned=await this.options.host.finish(this.state.id);
         if(!cleaned.ok)return {ok:false,error:{kind:'host',error:cleaned.error}};
       }
       this.kick();
@@ -145,10 +150,17 @@ export class RoundtableController {
       if(this.closed||!this.state||this.state.lifecycle!=='active')return;
       const observed=await this.source.read(this.state,null,'refresh');if(!observed.ok){this.options.onError({kind:'source',error:observed.error});return;}
       const settled=await this.settle(observed.value);if(!settled.ok){this.options.onError(settled.error);return;}
-      const effect=this.state.effects.find(effect=>effect.state.kind==='executing')??this.state.effects.find(effect=>effect.state.kind==='uncertain'&&satisfiedResult(this.state!,effect,observed.value))??this.state.effects.find(effect=>effect.state.kind==='ready');
+      const runnable=(effect:Effect):boolean=>{
+        if(effect.state.kind!=='ready')return false;
+        if(effect.action.kind!=='merge')return true;
+        const reference=effect.action.pr;
+        const pr=observed.value.prs.find(pr=>sameRef(pr.ref,reference));
+        return pr?.mergeable==='yes'&&pr.checks.kind==='passing';
+      };
+      const effect=this.state.effects.find(effect=>effect.state.kind==='executing')??this.state.effects.find(effect=>effect.state.kind==='uncertain'&&satisfiedResult(this.state!,effect,observed.value))??this.state.effects.find(runnable);
       if(!effect)return;
       const result=await this.drive(effect,observed.value);if(!result.ok){this.options.onError(result.error);return;}
-      if(this.state.effects.some(effect=>effect.state.kind==='ready'||effect.state.kind==='executing'))this.kick();
+      if(this.state.effects.some(effect=>runnable(effect)||effect.state.kind==='executing'))this.kick();
     });
   }
   private async drive(effect:Effect,facts:Facts):Promise<Result<null,RuntimeError>> {

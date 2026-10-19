@@ -29,12 +29,12 @@ export interface AgendaFiles {
   save(expectedVersion:number|null,state:Agenda):Promise<Result<null,StateError>>;
 }
 export type FileMetrics = {replaces:number;unchangedReplaces:number};
-export type SeatLaunch = {ticketId:string;revision:number;role:Role;agent:string;cwd:string;sourceSessionFile:string|null;prompt:string;ticket:Ticket|ClosureGate;workspace:Target};
+export type SeatLaunch = {agendaId:string;ticketId:string;revision:number;role:Role;agent:string;cwd:string;sourceSessionFile:string|null;prompt:string;ticket:Ticket|ClosureGate;workspace:Target};
 export type SeatHandle = {agentId:string;sessionFile:string;jobId:string};
 export interface HostPort {
   bind(ctx:ExtensionContext):Result<Caller,PortError>;
   launch(input:SeatLaunch):Promise<Result<SeatHandle,PortError>>;
   active(ticketId:string,role:Role):boolean;
-  finish(ownerSessionFiles:readonly string[]):Promise<Result<null,PortError>>;
+  finish(agendaId:string):Promise<Result<null,PortError>>;
   dispose():Promise<void>;
 }

@@ -84,14 +84,25 @@ export function createSourceReader(github:GitHubPort) {
       const expanded=await github.facts(scope,`${cause}:children`);if(!expanded.ok)return expanded;facts=expanded.value;
       if(parent&&facts.issues.find(item=>sameRef(item.ref,parent))?.children.some(child=>!facts.issues.some(item=>sameRef(item.ref,child))))return {ok:false,error:{kind:'unavailable',message:'Parent children changed during the complete read'}};
     }
-    if(state)for(const ticket of state.tickets){
-      const observed=ticket.pr?.ref?facts.prs.find(pr=>sameRef(pr.ref,ticket.pr!.ref!)):undefined;
-      const merge=ticket.terminal?.kind==='merged'?ticket.terminal.mergeSha:observed?.state.kind==='merged'?observed.state.sha:null;
-      const head=targetHead(facts,ticket.target);
-      if(merge&&head&&!facts.commits.some(item=>sameRepo(item.repo,ticket.target.repo)&&item.ancestor===merge&&item.descendant===head)){
-        const contained=await github.contains(ticket.target.repo,merge,head);if(!contained.ok)return contained;
-        facts.commits.push({repo:ticket.target.repo,ancestor:merge,descendant:head,result:contained.value});
+    async function observeMerge(target:Target,merge:string|null):Promise<Result<null,PortError>> {
+      const head=targetHead(facts,target);
+      if(merge&&head&&!facts.commits.some(item=>sameRepo(item.repo,target.repo)&&item.ancestor===merge&&item.descendant===head)){
+        const contained=await github.contains(target.repo,merge,head);if(!contained.ok)return contained;
+        facts.commits.push({repo:target.repo,ancestor:merge,descendant:head,result:contained.value});
       }
+      return {ok:true,value:null};
+    }
+    if(state)for(const ticket of state.tickets){
+      const resolution=operation?.op==='resolve'&&operation.ticketId===ticket.id?operation:null;
+      const reference=resolution?.adoptPr!==undefined?resolution.adoptPr:ticket.pr?.ref;
+      const observed=reference?facts.prs.find(pr=>sameRef(pr.ref,reference)):undefined;
+      const merge=observed?.state.kind==='merged'?observed.state.sha:resolution?.adoptPr===null?null:ticket.terminal?.kind==='merged'?ticket.terminal.mergeSha:null;
+      const compared=await observeMerge(resolution?.target??ticket.target,merge);if(!compared.ok)return compared;
+    }
+    const entries=operation?.op==='convene'?operation.tickets:operation?.op==='resolve'?operation.add??[]:[];
+    for(const entry of entries){
+      const observed=entry.adoptPr?facts.prs.find(pr=>sameRef(pr.ref,entry.adoptPr!)):undefined;
+      const compared=await observeMerge(entry.target,observed?.state.kind==='merged'?observed.state.sha:null);if(!compared.ok)return compared;
     }
     if(state)for(const effect of state.effects){
       if(effect.action.kind!=='createIssue'||effect.state.kind==='cancelled')continue;

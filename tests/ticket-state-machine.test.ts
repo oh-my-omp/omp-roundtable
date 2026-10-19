@@ -3,11 +3,8 @@ import {createHash} from 'node:crypto';
 import type {Agenda,Caller,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket} from '../src/domain/model.ts';
 import {applyOperation,availableRoles,confirmEffect,createAgenda,effectPrecondition,reconcile,satisfiedResult} from '../src/domain/engine.ts';
 
-// Regression coverage for the Ticket delivery lifecycle through the domain
-// engine's exported API. Effects are confirmed the way RoundtableController
-// does it: reconcile the observed Facts (settle), ask satisfiedResult for a
-// source-confirmed result, then confirmEffect (drive). No GitHub port is faked;
-// confirmation is earned from typed Facts instead.
+// These typed in-memory source snapshots exercise domain transitions only.
+// GitHub subprocess pagination and real TUI delivery have separate integration coverage.
 
 const REPO:Repo={owner:'RiriAgent',name:'rt-lifecycle'};
 const ISSUE:IssueRef={repo:REPO,number:189};
@@ -80,7 +77,7 @@ function issueSnapshot(state:'open'|'closed',lastClose:IssueSnapshot['lastClose'
 }
 
 function repoSnapshot(head:string):RepoSnapshot {
-  return {repo:REPO,defaultBranch:'main',defaultHead:head,bases:[{name:'main',state:{kind:'present',head,isDefault:true,rules:{required:[],strict:true,upToDate:true,constraints:[]}}}]};
+  return {repo:REPO,defaultBranch:'main',defaultHead:head,bases:[{name:'main',state:{kind:'present',head,isDefault:true,rules:{required:[],strict:true,constraints:[]}}}]};
 }
 
 function branch(head:string):Facts['branches'][number] {
@@ -296,4 +293,89 @@ describe('ticket delivery lifecycle',()=>{
     expect(merging).toEqual(mergingSnapshot);
     expect(merging.effects.filter(item=>item.action.kind==='merge').length).toBe(1);
   });
+});
+
+test('independent tickets are runnable while a dependent waits for source-confirmed noCode closure',()=>{
+  const source=openSource();
+  const second={repo:REPO,number:190},third={repo:REPO,number:191};
+  source.issues.push({...issueSnapshot('open',null),ref:second},{...issueSnapshot('open',null),ref:third});
+  let agenda=unwrap(createAgenda({op:'convene',parent:null,tickets:[
+    {id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null},
+    {id:'B',issue:second,target:TARGET,dependsOn:[],adoptPr:null},
+    {id:'C',issue:third,target:TARGET,dependsOn:[TICKET],adoptPr:null},
+  ]},source,AT,'agenda-parallel'),'convene parallel graph');
+  const main:Caller={kind:'main',agentId:'Main',sessionId:'coordinator',sessionFile:null};
+  agenda.run={kind:'attached',id:'run',mainAgentId:main.agentId,mainSessionId:main.sessionId};
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['owner']);
+  expect(availableRoles(agenda,ticketOf(agenda,'B'))).toEqual(['owner']);
+  expect(availableRoles(agenda,ticketOf(agenda,'C'))).toEqual([]);
+  agenda=unwrap(applyOperation(agenda,{op:'escalate',ticketId:TICKET,revision:1,kind:'noCode',reason:'The required behavior already exists.'},seat('owner',OWNER_SESSION,1),source,AT),'noCode escalation');
+  agenda=unwrap(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:ticketOf(agenda).revision,ruling:'Verified the existing behavior.',to:'Done',noCode:'Already satisfied at source.'},main,source,AT),'noCode ruling');
+  expect(ticketOf(agenda).state).not.toBe('Done');
+  expect(availableRoles(agenda,ticketOf(agenda,'C'))).toEqual([]);
+  source.issues[0]!.state='closed';
+  source.issues[0]!.lastClose={id:'no-code-close',at:AT+1};
+  const effect=effectOf(agenda,item=>item.action.kind==='setIssueState');
+  const result=satisfiedResult(agenda,effect,source);
+  if(!result)throw new Error('Closure was not observed');
+  confirmEffect(agenda,effect,result,source,AT+1);
+  expect(ticketOf(agenda).terminal?.kind).toBe('noCode');
+  expect(ticketOf(agenda).state).toBe('Done');
+  expect(availableRoles(agenda,ticketOf(agenda,'C'))).toEqual(['owner']);
+});
+
+test('a cyclic dependency graph is rejected before an agenda can run',()=>{
+  const source=openSource(),other={repo:REPO,number:190};
+  source.issues.push({...issueSnapshot('open',null),ref:other});
+  const result=createAgenda({op:'convene',parent:null,tickets:[
+    {id:'A',issue:ISSUE,target:TARGET,dependsOn:['B'],adoptPr:null},
+    {id:'B',issue:other,target:TARGET,dependsOn:['A'],adoptPr:null},
+  ]},source,AT,'agenda-cycle');
+  expect(result).toMatchObject({ok:false,error:{kind:'invalidTopology'}});
+});
+
+test('parent membership remains valid after a topology ruling and closure rejects ticket-only fields',()=>{
+  const parent={repo:REPO,number:1},other={repo:REPO,number:190};
+  const facts=openSource();
+  facts.issues.push({...issueSnapshot('open',null),ref:other},{...issueSnapshot('open',null),ref:parent,children:[ISSUE,other]});
+  const agenda=unwrap(createAgenda({op:'convene',parent,tickets:[
+    {id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null},
+    {id:'other',issue:other,target:TARGET,dependsOn:[],adoptPr:null},
+  ]},facts,AT,'parent-agenda'),'parent convene');
+  const main:Caller={kind:'main',agentId:'Main',sessionId:'parent-main',sessionFile:null};
+  agenda.run={kind:'attached',id:'run',mainAgentId:main.agentId,mainSessionId:main.sessionId};
+  expect(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:1,to:'Coding',ruling:'Remove still attached child.',remove:['other']},main,facts,AT)).toMatchObject({ok:false,error:{kind:'invalidTopology'}});
+  expect(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:1,to:'Coding',ruling:'Add parent as child.',add:[{id:'parent',issue:parent,target:TARGET,dependsOn:[],adoptPr:null}]},main,facts,AT)).toMatchObject({ok:false,error:{kind:'invalidTopology'}});
+  for(const ticket of agenda.tickets){ticket.state='Done';ticket.terminal={kind:'noCode',bodyHash:ticket.contract.bodyHash,reason:'Already satisfied',at:AT};}
+  for(const issue of facts.issues)if(issue.ref.number!==parent.number)issue.state='closed';
+  reconcile(agenda,facts,AT);
+  const closure=agenda.closure;if(!closure)throw new Error('Expected closure');
+  expect(applyOperation(agenda,{op:'resolve',ticketId:closure.id,revision:closure.revision,to:'Reviewing',ruling:'Invalid closure topology edit.',remove:['other']},main,facts,AT)).toMatchObject({ok:false,error:{kind:'invalidTransition'}});
+});
+
+test('GitHub draft and behind observations cannot authorize a merge or masquerade as a conflict',()=>{
+  for(const status of ['behind','draft'] as const){
+    const {agenda,facts}=driveToMerging();facts.prs[0]!.mergeable=status;
+    reconcile(agenda,facts,AT);
+    const ticket=ticketOf(agenda);
+    expect(ticket.state).toBe(status==='behind'?'Coding':'Escalated');
+    expect(ticket.gates.review).toBeNull();
+    expect(ticket.notes.at(-1)?.text).not.toBe('PR conflicts with the target.');
+    expect(effectPrecondition(agenda,effectOf(agenda,effect=>effect.action.kind==='merge'),facts)).not.toBeNull();
+  }
+});
+
+test('Main revoking noCode cancels its queued close before coding resumes',()=>{
+  const facts=openSource();
+  let agenda=conveneTicket();
+  const main:Caller={kind:'main',agentId:'Main',sessionId:'revocation-main',sessionFile:null};
+  agenda.run={kind:'attached',id:'run',mainAgentId:main.agentId,mainSessionId:main.sessionId};
+  agenda=unwrap(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:1,to:'Done',noCode:'Already satisfied.',ruling:'First inspection.'},main,facts,AT),'noCode');
+  const close=effectOf(agenda,effect=>effect.action.kind==='setIssueState');
+  expect(close.state.kind).toBe('ready');
+  agenda=unwrap(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:ticketOf(agenda).revision,to:'Coding',ruling:'New evidence requires code before closure.'},main,facts,AT+1),'revoke noCode');
+  expect(ticketOf(agenda).state).toBe('Coding');
+  expect(ticketOf(agenda).terminal).toBeNull();
+  expect(effectOf(agenda,effect=>effect.action.kind==='setIssueState').state.kind).toBe('cancelled');
+  expect(effectPrecondition(agenda,close,facts)).not.toBeNull();
 });

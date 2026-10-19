@@ -1,8 +1,7 @@
 import {execFile} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
-import {mkdir,mkdtemp,rm} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
-import {basename,dirname,join,resolve,sep} from 'node:path';
+import {mkdir,mkdtemp,readdir,rm} from 'node:fs/promises';
+import {basename,dirname,join,resolve} from 'node:path';
 import {promisify} from 'node:util';
 import {createAgentSession,z,type AgentSession,type ExtensionContext} from '@oh-my-pi/pi-coding-agent';
 import type {ToolDefinition} from '@oh-my-pi/pi-coding-agent/extensibility/extensions/types';
@@ -10,6 +9,7 @@ import {AgentRegistry,MAIN_AGENT_ID} from '@oh-my-pi/pi-coding-agent/registry/ag
 import {SessionManager} from '@oh-my-pi/pi-coding-agent/session/session-manager';
 import {discoverAgents,getAgent} from '@oh-my-pi/pi-coding-agent/task/discovery';
 import {cfgTaskAgentModelOverrides,cfgTaskDisabledAgents} from '@oh-my-pi/pi-coding-agent/task/settings';
+import {createSubagentSettings} from '@oh-my-pi/pi-coding-agent/task/executor';
 import {resolveAgentModelSelection} from '@oh-my-pi/pi-coding-agent/config/model-resolver';
 import {initializeExtensions} from '@oh-my-pi/pi-coding-agent/modes/runtime-init';
 import {buildPublicGrammar} from '../domain/public-grammar.ts';
@@ -59,19 +59,20 @@ export function createHostPort(options:HostOptions):HostPort {
         const agent=getAgent([...discovery.agents,...parent.getSessionAgents()],input.agent);
         if(!agent||cfgTaskDisabledAgents.get(parent.settings).includes(input.agent))throw new Error(`Configured seat agent is unavailable: ${input.agent}`);
         if(agent.blocking)throw new Error('Roundtable requires a nonblocking seat agent');
-        await mkdir(options.sessionDir,{recursive:true,mode:0o700});
+        const sessionDir=join(options.sessionDir,input.agendaId);
+        await mkdir(sessionDir,{recursive:true,mode:0o700});
         if(input.sourceSessionFile){
           if(input.role!=='owner')throw new Error('Gate sessions must never inherit history');
           const prior=await SessionManager.peekSessionInit(input.sourceSessionFile);
           if(!prior)throw new Error('Owner fork source has no native session contract');
           workspace=prior.cwd;
-          manager=await SessionManager.forkFrom(input.sourceSessionFile,workspace,options.sessionDir,undefined,{copyArtifacts:false,suppressBreadcrumb:true});
+          manager=await SessionManager.forkFrom(input.sourceSessionFile,workspace,sessionDir,undefined,{copyArtifacts:false,suppressBreadcrumb:true});
         }else{
-          const root=await mkdtemp(join(tmpdir(),'roundtable-seat-'));
+          const root=await mkdtemp('/tmp/roundtable-seat-');
           workspace=join(root,'repo');ephemeralWorkspace=input.role!=='owner';
           await runFile('gh',['repo','clone',`${input.workspace.repo.owner}/${input.workspace.repo.name}`,workspace,'--','--quiet'],{cwd:input.cwd});
           await runFile('git',['checkout','--detach',`origin/${input.workspace.base}`],{cwd:workspace});
-          manager=SessionManager.create(workspace,options.sessionDir);
+          manager=SessionManager.create(workspace,sessionDir);
           await manager.ensureOnDisk();
         }
         const sessionFile=manager.getSessionFile();if(!sessionFile)throw new Error('Native seat session must be persistent');
@@ -114,7 +115,7 @@ export function createHostPort(options:HostOptions):HostPort {
         });
         const cacheKey=manager.getHeader()?.providerPromptCacheKey??manager.getHeader()?.id;
         const created=await createAgentSession({cwd:workspace,sessionManager:manager,authStorage:parent.modelRegistry.authStorage,modelRegistry:parent.modelRegistry,
-          credentialSourceSessionId:parent.sessionManager.getSessionId(),settings:parent.settings,
+          credentialSourceSessionId:parent.sessionManager.getSessionId(),settings:createSubagentSettings(parent.settings),
           ...(!input.sourceSessionFile&&modelSelection.patterns?{modelPattern:modelSelection.patterns}:{}),
           ...(input.sourceSessionFile&&cacheKey?{providerPromptCacheKey:cacheKey,providerPromptCacheKeySource:'fork' as const}:{}),
           ...(savedContract.success?{systemPrompt:savedContract.data.systemPrompt}:{appendSystemPrompt:agent.systemPrompt}),
@@ -142,6 +143,11 @@ export function createHostPort(options:HostOptions):HostPort {
           try {
             if(signal.aborted)throw new Error('Seat was cancelled before dispatch');
             await session.prompt(prompt);
+            await session.waitForIdle();
+            while(session.hasPendingAsyncWork()){
+              if(signal.aborted)throw new Error('Seat was cancelled while descendant work settled');
+              await session.settleAsyncWork();
+            }
             return handedOff?`Ticket ${input.ticketId} handed off.`:`Ticket ${input.ticketId} exited without handoff.`;
           }catch(cause){
             error=cause instanceof Error?cause.message:String(cause);
@@ -160,20 +166,29 @@ export function createHostPort(options:HostOptions):HostPort {
       }catch(error){
         seats.delete(id);
         if(seat.session)await seat.session.dispose();else if(manager)await manager.close();
-        if(workspace&&ephemeralWorkspace)await rm(join(workspace,'..'),{recursive:true,force:true});
+        if(workspace&&!input.sourceSessionFile)await rm(join(workspace,'..'),{recursive:true,force:true});
         const detail:PortError={kind:'unavailable',message:error instanceof Error?error.message:String(error)};
         return {ok:false,error:detail};
       }
     },
-    async finish(files){
+    async finish(agendaId){
       try {
-        for(const file of files){
-          if(!resolve(file).startsWith(`${resolve(options.sessionDir)}${sep}`))throw new Error('Owner session is outside the owned session directory');
+        const sessionDir=join(options.sessionDir,agendaId);
+        if(dirname(resolve(sessionDir))!==resolve(options.sessionDir))throw new Error('Invalid agenda session directory');
+        let names:string[];
+        try {names=await readdir(sessionDir);}catch(error){
+          if(typeof error==='object'&&error!==null&&'code' in error&&error.code==='ENOENT')return {ok:true,value:null};
+          throw error;
+        }
+        const roots=new Set<string>();
+        for(const name of names){
+          if(!name.endsWith('.jsonl'))continue;
+          const file=join(sessionDir,name);
           const prior=await SessionManager.peekSessionInit(file);
           if(!prior)throw new Error(`Cannot inspect Owner workspace for ${file}`);
           const root=dirname(prior.cwd);
-          if(basename(prior.cwd)!=='repo'||!basename(root).startsWith('roundtable-seat-')||root!==join(tmpdir(),basename(root)))throw new Error('Refusing to remove a workspace not created by this seat host');
-          await rm(root,{recursive:true,force:true});
+          if(basename(prior.cwd)!=='repo'||!basename(root).startsWith('roundtable-seat-')||root!==join('/tmp',basename(root)))throw new Error('Refusing to remove a workspace not created by this seat host');
+          if(!roots.has(root)){await rm(root,{recursive:true,force:true});roots.add(root);}
         }
         return {ok:true,value:null};
       }catch(error){return {ok:false,error:{kind:'unavailable',message:error instanceof Error?error.message:String(error)}};}

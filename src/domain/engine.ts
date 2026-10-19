@@ -21,7 +21,7 @@ function ticketFrom(entry:Entry,facts:Facts):Result<Ticket,DomainError> {
     gates:{review:null,accept:null,postMerge:null},rulings:[],notes:[],terminal:null};
   if(entry.adoptPr){
     const pr=facts.prs.find(pr=>sameRef(pr.ref,entry.adoptPr!));
-    if(!pr||!sameTarget(pr.target,ticket.target)||!pr.closes.some(issue=>sameRef(issue,ticket.issue)))return reject('sourceChanged','Adopted PR does not match the issue and target');
+    if(!pr||!sameTarget(pr.target,ticket.target)||pr.closes.length!==1||!sameRef(pr.closes[0]!,ticket.issue))return reject('sourceChanged','Adopted PR must close exactly this issue at the target');
     ticket.pr={ref:pr.ref,headRepo:pr.headRepo,branch:pr.headBranch,head:pr.head,title:pr.title,body:pr.body};
     if(pr.state.kind==='merged'){
       ticket.terminal={kind:'merged',pr:pr.ref,mergeSha:pr.state.sha,at:pr.state.at};ticket.state='Verifying';
@@ -84,7 +84,7 @@ function pending(stamp:GateStamp):GateRecord{return {stamp,status:'pending',note
 function sourcePr(ticket:Ticket,facts:Facts):PrSnapshot|undefined{return ticket.pr?.ref?facts.prs.find(pr=>sameRef(pr.ref,ticket.pr!.ref!)):undefined;}
 function mergeReady(ticket:Ticket,pr:PrSnapshot,facts:Facts):boolean {
   const base=facts.repos.find(item=>sameRepo(item.repo,ticket.target.repo))?.bases.find(item=>item.name===ticket.target.base);
-  return pr.state.kind==='open'&&pr.mergeable==='yes'&&pr.checks.kind==='passing'&&base?.state.kind==='present'&&(!base.state.rules.strict||base.state.rules.upToDate);
+  return pr.state.kind==='open'&&pr.mergeable==='yes'&&pr.checks.kind==='passing'&&base?.state.kind==='present';
 }
 /** Reconcile only fresh, complete GitHub observations. No local intent establishes source state. */
 export function reconcile(state:Agenda,facts:Facts,at:number):void {
@@ -105,8 +105,12 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
       const review=gateStamp(state,ticket,'review',facts),accept=gateStamp(state,ticket,'accept',facts);
       if(!pr||!review||!accept||ticket.gates.review&&canonical(ticket.gates.review.stamp)!==canonical(review)||ticket.gates.accept&&canonical(ticket.gates.accept.stamp)!==canonical(accept)){
         escalate(ticket,'PR head, target, closing link, body, or review contract changed; fresh gates are required.',at);
-      }else if(pr.checks.kind==='failing'||pr.mergeable==='no'){
-        invalidate(ticket);ticket.state='Coding';note(ticket,'system',pr.mergeable==='no'?'conflict':'checks',pr.mergeable==='no'?'PR conflicts with the target.':JSON.stringify(pr.checks),at);
+      }else if(pr.mergeable==='draft'){
+        escalate(ticket,'The PR is a draft; Main must obtain a source change or adopt a ready PR.',at);
+      }else if(pr.checks.kind==='failing'||pr.mergeable==='no'||pr.mergeable==='behind'){
+        invalidate(ticket);ticket.state='Coding';
+        note(ticket,'system',pr.mergeable==='no'||pr.mergeable==='behind'?'conflict':'checks',
+          pr.mergeable==='no'?'PR conflicts with the target.':pr.mergeable==='behind'?'GitHub requires this branch to be updated with the target.':JSON.stringify(pr.checks),at);
       }else if(ticket.state==='Reviewing'){
         ticket.gates.review??=pending(review);ticket.gates.accept??=pending(accept);
         if(ticket.gates.review.status==='passed'&&ticket.gates.accept.status==='passed'&&mergeReady(ticket,pr,facts)&&dependenciesDone(state,ticket)){
@@ -130,6 +134,7 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
     if(effect.state.kind!=='ready')continue;
     const ticket=state.tickets.find(ticket=>ticket.id===effect.ticketId);
     if(effect.action.kind==='merge'&&ticket?.state!=='Merging'||effect.action.kind==='publishPr'&&ticket?.state!=='Publishing')effect.state={kind:'cancelled',reason:'Ticket no longer authorizes this effect'};
+    if(ticket&&effect.action.kind==='setIssueState'&&!effect.action.open&&ticket.state==='Coding')effect.state={kind:'cancelled',reason:'Main reopened coding and revoked the accepted closure'};
   }
   const stamp=closureStamp(state,facts);
   if(state.parent){
@@ -157,7 +162,11 @@ export function effectPrecondition(state:Agenda,effect:Effect,facts:Facts):strin
       const branch=facts.branches.find(branch=>sameRepo(branch.repo,action.headRepo)&&branch.name===action.branch);
       if(branch?.state.kind!=='present'||branch.state.head!==action.head)return 'Submitted branch head changed';
       if(!exactClosingBody(action.body,action.issue,action.target.repo))return 'PR must close exactly its issue';
-      if(action.pr){const pr=facts.prs.find(pr=>sameRef(pr.ref,action.pr!));if(!pr||pr.state.kind!=='open'||pr.bodyHash!==action.expectedBodyHash)return 'PR edit baseline changed';}
+      if(action.pr){
+        const pr=facts.prs.find(pr=>sameRef(pr.ref,action.pr!));
+        if(!pr||pr.state.kind!=='open'||pr.bodyHash!==action.expectedBodyHash)return 'PR edit baseline changed';
+        if(!facts.maintenance.some(item=>sameRef(item.pr,action.pr!)&&item.result.kind==='maintainable'))return 'The authenticated actor does not own an authorized editable PR';
+      }
       return null;
     }
     case 'merge':{
@@ -170,7 +179,7 @@ export function effectPrecondition(state:Agenda,effect:Effect,facts:Facts):strin
       const issue=facts.issues.find(issue=>sameRef(issue.ref,action.issue));
       if(!issue||issue.bodyHash!==action.bodyHash||(action.open?issue.lastClose:issue.lastReopen)?.id!==(action.afterEvent??undefined))return 'Issue body or opposite lifecycle event changed';
       if(!action.open){
-        if(ticket){if(ticket.terminal?.kind==='noCode'&&ticket.terminal.bodyHash===issue.bodyHash)return null;if(ticket.state==='Verifying'&&ticket.gates.postMerge?.status==='passed')return null;return 'Ticket has no accepted closure';}
+        if(ticket){if(ticket.state==='Escalated'&&ticket.terminal?.kind==='noCode'&&ticket.terminal.bodyHash===issue.bodyHash)return null;if(ticket.state==='Verifying'&&ticket.gates.postMerge?.status==='passed')return null;return 'Ticket has no accepted closure';}
         if(state.closure?.id!==effect.ticketId||state.closure.gate.status!=='passed'||!closureStamp(state,facts)||canonical(state.closure.gate.stamp)!==canonical(closureStamp(state,facts)))return 'Parent closure gate changed';
       }
       return null;
@@ -254,7 +263,9 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
   const seat=caller.kind==='seat'&&caller.ticketId===operation.ticketId&&caller.revision===operation.revision;
   if(operation.op==='resolve'){
     if(!main)return reject('unauthorized','Only the attached Main may resolve');
+    if(operation.noCode&&operation.to!=='Done')return reject('invalidTransition','noCode is valid only when resolving to Done');
     if(closure){
+      if(operation.add||operation.remove||operation.dependsOn||operation.target||operation.adoptPr!==undefined||operation.noCode)return reject('invalidTransition','Closure resolution accepts only a ruling and effect dispositions; edit topology on a delivery ticket');
       if(operation.to!=='Reviewing')return reject('invalidTransition','Closure can only return to Reviewing');
       closure.rulings.push({at,summary:operation.ruling});closure.state='Reviewing';closure.revision++;
       const stamp=closureStamp(next,facts);if(!stamp)return reject('sourceChanged','Children are not complete at source');
@@ -267,28 +278,35 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
         next.effects=next.effects.filter(effect=>!operation.remove!.includes(effect.ticketId));
         if(!next.tickets.includes(ticket))return reject('invalidTransition','Resolution cannot remove its own ticket');
       }
+      if(next.parent){
+        const parent=facts.issues.find(issue=>sameRef(issue.ref,next.parent!));
+        if(!parent||parent.children.some(child=>!next.tickets.some(item=>sameRef(item.issue,child)))||next.tickets.some(item=>sameRef(item.issue,next.parent!)))return reject('invalidTopology','Every attached child must retain a ticket, and the parent cannot be a delivery ticket');
+      }
       const source=facts.issues.find(issue=>sameRef(issue.ref,ticket.issue));if(!source)return reject('sourceUnavailable','Issue contract is unavailable');
       if(source.bodyHash!==ticket.contract.bodyHash)ticket.contract={revision:ticket.contract.revision+1,bodyHash:source.bodyHash,body:source.body};
       ticket.rulings.push({at,summary:operation.ruling});note(ticket,'main','ruling',operation.ruling,at);invalidate(ticket);
       if(operation.dependsOn)ticket.dependsOn=operation.dependsOn;
       if(operation.target)ticket.target=operation.target;
-      if(operation.adoptPr){
+      if(operation.adoptPr===null){ticket.pr=null;ticket.terminal=null;}
+      else if(operation.adoptPr){
         const pr=facts.prs.find(pr=>sameRef(pr.ref,operation.adoptPr!));
         if(!pr||!sameTarget(pr.target,ticket.target)||pr.closes.length!==1||!sameRef(pr.closes[0]!,ticket.issue))return reject('sourceChanged','Adopted PR does not close this issue at the target');
         ticket.pr={ref:pr.ref,headRepo:pr.headRepo,branch:pr.headBranch,head:pr.head,title:pr.title,body:pr.body};
-        if(pr.state.kind==='merged')ticket.terminal={kind:'merged',pr:pr.ref,mergeSha:pr.state.sha,at:pr.state.at};
+        ticket.terminal=pr.state.kind==='merged'?{kind:'merged',pr:pr.ref,mergeSha:pr.state.sha,at:pr.state.at}:null;
       }else if(ticket.pr?.ref){
         const pr=sourcePr(ticket,facts);if(pr&&pr.state.kind==='open')ticket.pr={ref:pr.ref,headRepo:pr.headRepo,branch:pr.headBranch,head:pr.head,title:pr.title,body:pr.body};
       }
       ticket.state=operation.to;
+      if(operation.to==='Coding'&&ticket.terminal?.kind==='noCode')ticket.terminal=null;
       if(operation.to==='Done'){
         if(operation.noCode){
           ticket.terminal={kind:'noCode',bodyHash:source.bodyHash,reason:operation.noCode,at};
-          if(source.state!=='closed'){ticket.state='Escalated';enqueue(next,ticket.id,{kind:'setIssueState',issue:ticket.issue,open:false,bodyHash:source.bodyHash,afterEvent:source.lastReopen?.id??null});}
-        }else if(ticket.terminal?.kind!=='merged'||source.state!=='closed'||!gateStamp(next,ticket,'postMerge',facts))return reject('sourceChanged','Done requires source-confirmed noCode or a valid closed merged issue');
+          if(source.state!=='closed'){
+            ticket.state='Escalated';
+            if(!next.effects.some(effect=>effect.ticketId===ticket.id&&effect.action.kind==='setIssueState'&&!effect.action.open&&effect.action.bodyHash===source.bodyHash&&effect.state.kind!=='cancelled'&&effect.state.kind!=='confirmed'))enqueue(next,ticket.id,{kind:'setIssueState',issue:ticket.issue,open:false,bodyHash:source.bodyHash,afterEvent:source.lastReopen?.id??null});
+          }
+        }
       }
-      if(operation.to==='Verifying'&&ticket.terminal?.kind!=='merged')return reject('invalidTransition','Verifying requires a source-confirmed merged PR');
-      if(operation.to==='Reviewing'&&!gateStamp(next,ticket,'review',facts))return reject('sourceChanged','Reviewing requires a current open PR');
     }
     for(const resolution of operation.effects??[]){
       const effect=next.effects.find(effect=>effect.id===resolution.effectId&&effect.ticketId===operation.ticketId);
@@ -299,10 +317,20 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
         case 'retry':{
           const result=satisfiedResult(next,effect,facts);
           if(result)confirmEffect(next,effect,result,facts,at);
-          else {effect.state={kind:'ready'};if(ticket&&effect.action.kind==='publishPr')ticket.state='Publishing';if(ticket&&effect.action.kind==='merge')ticket.state='Merging';}
+          else if(effect.action.kind==='merge'){
+            effect.state={kind:'cancelled',reason:'Main requested retry; merge must acquire fresh gates'};
+            if(ticket)ticket.state='Reviewing';
+          }else {effect.state={kind:'ready'};if(ticket&&effect.action.kind==='publishPr')ticket.state='Publishing';}
           break;
         }
       }
+    }
+    if(next.effects.some(effect=>effect.ticketId===operation.ticketId&&(effect.state.kind==='failed'||effect.state.kind==='uncertain'||effect.state.kind==='executing')))return reject('invalidTransition','Resolve every failed or uncertain effect before reopening work on this ticket');
+    if(ticket){
+      const source=facts.issues.find(issue=>sameRef(issue.ref,ticket.issue));
+      if(ticket.state==='Done'&&!operation.noCode&&(ticket.terminal?.kind!=='merged'||source?.state!=='closed'||!gateStamp(next,ticket,'postMerge',facts)))return reject('sourceChanged','Done requires source-confirmed noCode or a valid closed merged issue');
+      if(ticket.state==='Verifying'&&ticket.terminal?.kind!=='merged')return reject('invalidTransition','Verifying requires a source-confirmed merged PR');
+      if(ticket.state==='Reviewing'&&!gateStamp(next,ticket,'review',facts))return reject('sourceChanged','Reviewing requires a current open PR');
     }
     for(const action of operation.actions??[])enqueue(next,operation.ticketId,action);
     const topology=validateTopology(next);if(topology)return reject('invalidTopology',topology);

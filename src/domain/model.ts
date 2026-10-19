@@ -42,13 +42,13 @@ export const checksSchema = z.union([
   object({kind:z.literal('unknown'),reason:text}),
 ]);
 export type ChecksSnapshot = z.infer<typeof checksSchema>;
-export const mergeRequirementsSchema = object({required:z.array(requiredCheckIdentitySchema),strict:z.boolean(),upToDate:z.boolean(),constraints:z.array(text)});
+export const mergeRequirementsSchema = object({required:z.array(requiredCheckIdentitySchema),strict:z.boolean(),constraints:z.array(text)});
 export type MergeRequirements = z.infer<typeof mergeRequirementsSchema>;
 export const prStateSchema = z.union([
   object({kind:z.literal('open')}),object({kind:z.literal('closed')}),
   object({kind:z.literal('merged'),sha:shaSchema,at:millisSchema}),
 ]);
-export const prSnapshotSchema = object({ref:prRefSchema,headRepo:repoSchema,headBranch:text,head:shaSchema,target:targetSchema,title:text,body:z.string(),bodyHash:hashSchema,updatedAt:millisSchema,state:prStateSchema,closes:z.array(issueRefSchema),mergeable:z.enum(['yes','no','unknown']),checks:checksSchema});
+export const prSnapshotSchema = object({ref:prRefSchema,headRepo:repoSchema,headBranch:text,head:shaSchema,target:targetSchema,title:text,body:z.string(),bodyHash:hashSchema,updatedAt:millisSchema,state:prStateSchema,closes:z.array(issueRefSchema),mergeable:z.enum(['yes','no','behind','draft','unknown']),checks:checksSchema});
 export type PrSnapshot = z.infer<typeof prSnapshotSchema>;
 export const baseSnapshotSchema = object({name:text,state:z.union([
   object({kind:z.literal('missing')}),object({kind:z.literal('present'),head:shaSchema,isDefault:z.boolean(),rules:mergeRequirementsSchema}),
