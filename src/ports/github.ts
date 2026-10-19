@@ -90,28 +90,34 @@ function sameBranchState(left:m.BranchSnapshot['state'],right:m.BranchSnapshot['
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 const quote = (value: string) => JSON.stringify(value);
 const pathRepo = (value: m.Repo) => `repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}`;
-const branchFields = `name target { oid } branchProtectionRule { requiresStatusChecks requiresStrictStatusChecks requiredStatusChecks { context app { databaseId } } } rules(first:10) { pageInfo { hasNextPage endCursor } nodes { type repositoryRuleset { name enforcement } parameters { __typename ... on RequiredStatusChecksParameters { strictRequiredStatusChecksPolicy requiredStatusChecks { context integrationId } } } } }`;
-const repoFields = `nameWithOwner viewerPermission defaultBranchRef { ${branchFields} }`;
+const PAGE = 10;
+const afterClause = (cursor: string | null) => (cursor === null ? '' : `,after:${quote(cursor)}`);
+const ruleNodeFields = `type repositoryRuleset { name enforcement } parameters { __typename ... on RequiredStatusChecksParameters { strictRequiredStatusChecksPolicy requiredStatusChecks { context integrationId } } }`;
+// One page of each drilled connection; a follow-up page repeats every argument verbatim.
+const rulesPage = (cursor: string | null) => `rules(first:${PAGE}${afterClause(cursor)}) { pageInfo { hasNextPage endCursor } nodes { ${ruleNodeFields} } }`;
 const referenceFields = 'number repository { nameWithOwner }';
-function prFields(number: number): string {
+const subIssuesPage = (cursor: string | null) => `subIssues(first:${PAGE}${afterClause(cursor)}) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }`;
+const closedByPage = (cursor: string | null) => `closedByPullRequestsReferences(first:${PAGE},includeClosedPrs:true${afterClause(cursor)}) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }`;
+const closingRefsPage = (cursor: string | null) => `closingIssuesReferences(first:${PAGE}${afterClause(cursor)}) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }`;
+const contextsPage = (number: number, cursor: string | null) => {
   const required = `isRequired(pullRequestNumber:${number})`;
+  return `contexts(first:${PAGE}${afterClause(cursor)}) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { databaseId name status conclusion detailsUrl ${required} checkSuite { databaseId commit { oid } app { databaseId slug } workflowRun { databaseId runAttempt } } } ... on StatusContext { context state targetUrl ${required} } } }`;
+};
+const branchFields = `name target { oid } branchProtectionRule { requiresStatusChecks requiresStrictStatusChecks requiredStatusChecks { context app { databaseId } } } ${rulesPage(null)}`;
+const repoFields = `nameWithOwner viewerPermission defaultBranchRef { ${branchFields} }`;
+function prFields(number: number): string {
   return `number repository { ${repoFields} } title body updatedAt state headRefOid headRefName baseRefName
     headRepository { nameWithOwner viewerPermission } headRef { target { oid } } baseRef { ${branchFields} } baseRepository { ${repoFields} }
     author { login } maintainerCanModify mergeable mergeStateStatus mergedAt mergeCommit { oid }
-    closingIssuesReferences(first:10) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }
-    statusCheckRollup { contexts(first:10) { pageInfo { hasNextPage endCursor } nodes { __typename ... on CheckRun { databaseId name status conclusion detailsUrl ${required} checkSuite { databaseId commit { oid } app { databaseId slug } workflowRun { databaseId runAttempt } } } ... on StatusContext { context state targetUrl ${required} } } } }`;
+    ${closingRefsPage(null)}
+    statusCheckRollup { ${contextsPage(number, null)} }`;
 }
 // Linked PRs need a second, explicitly numbered query, not a fabricated isRequired.
-const issueFields = `${referenceFields} body updatedAt state subIssues(first:10) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }
+const issueFields = `${referenceFields} body updatedAt state ${subIssuesPage(null)}
  lastClose:timelineItems(last:1,itemTypes:[CLOSED_EVENT]) { nodes { ... on ClosedEvent { id createdAt } } }
  lastReopen:timelineItems(last:1,itemTypes:[REOPENED_EVENT]) { nodes { ... on ReopenedEvent { id createdAt } } }
- closedByPullRequestsReferences(first:10,includeClosedPrs:true) { pageInfo { hasNextPage endCursor } nodes { ${referenceFields} } }`;
-function complete(value: { pageInfo: { hasNextPage: boolean } }, label: string): void {
-  if (value.pageInfo.hasNextPage) fail('invalidResponse', `${label}: required connection pagination is incomplete`);
-}
+ ${closedByPage(null)}`;
 function issueSnapshot(source: z.infer<typeof issueRead>): m.IssueSnapshot {
-  complete(source.subIssues, 'subissues');
-  complete(source.closedByPullRequestsReferences, 'closing PR links');
   const closed = source.lastClose.nodes[0], reopened = source.lastReopen.nodes[0];
   return { ref: ref(source), body: source.body, bodyHash: digest(source.body), updatedAt: source.updatedAt,
     state: source.state === 'OPEN' ? 'open' : 'closed',
@@ -120,7 +126,6 @@ function issueSnapshot(source: z.infer<typeof issueRead>): m.IssueSnapshot {
     children: source.subIssues.nodes.map(ref) };
 }
 function requirements(value: z.infer<typeof sourceBranch>): m.MergeRequirements {
-  complete(value.rules, 'effective branch rules');
   const required: m.RequiredCheckIdentity[] = [];
   let strict = false;
   const add = (name: string, id: number | null) => {
@@ -153,7 +158,6 @@ function requirements(value: z.infer<typeof sourceBranch>): m.MergeRequirements 
 }
 function checks(value: SourcePr, rules: m.MergeRequirements): m.ChecksSnapshot {
   const rollup = value.statusCheckRollup;
-  if (rollup) complete(rollup.contexts, 'PR checks');
   if (!rules.required.length) return { kind: 'passing', required: [] };
   const failures: m.CheckFailure[] = [];
   const pending: { identity: m.RequiredCheckIdentity; head: string }[] = [];
@@ -263,6 +267,102 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
     return data;
   }
   const selection = (value: m.Repo, fields: string) => `repository(owner:${quote(value.owner)},name:${quote(value.name)}) { ${fields} }`;
+  type SourcePage<Element> = { nodes: Element[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+  // Drain one source connection to its final page. Each follow-up restates the
+  // parent identity and the same anchor the first page was bound to, so a later
+  // page can never be appended to a different issue, PR, branch or commit.
+  async function drain<Element>(options: {
+    label: string; cause: string; first: SourcePage<Element>; anchor: string;
+    next: (after: string) => string;
+    read: (data: Record<string, unknown>) => { anchor: string; connection: SourcePage<Element> };
+  }): Promise<Element[]> {
+    const nodes = [...options.first.nodes];
+    const cursors = new Set<string>();
+    let connection: SourcePage<Element> = options.first;
+    while (connection.pageInfo.hasNextPage) {
+      const cursor = connection.pageInfo.endCursor;
+      if (cursor === null || cursors.has(cursor)) return fail('invalidResponse', `${options.label}: pagination cursor did not advance`);
+      cursors.add(cursor);
+      const page = options.read(await graph(`query { ${options.next(cursor)} }`, options.cause));
+      if (page.anchor !== options.anchor) fail('invalidResponse', `${options.label}: source identity changed during pagination`);
+      nodes.push(...page.connection.nodes);
+      connection = page.connection;
+    }
+    return nodes;
+  }
+  async function completeIssueConnections(source: z.infer<typeof issueRead>, cause: string): Promise<void> {
+    const repository = repo(source.repository);
+    const anchor = `${repoKey(repository)}#${source.number}`;
+    if (source.subIssues.pageInfo.hasNextPage) {
+      const nodes = await drain({
+        label: `${anchor} subissues`, cause, first: source.subIssues, anchor,
+        next: after => selection(repository, `issue(number:${source.number}) { number repository { nameWithOwner } ${subIssuesPage(after)} }`),
+        read: data => {
+          const issue = decode(z.object({ repository: z.object({ issue: z.object({ ...sourceRefFields, subIssues: connection(sourceRef) }) }) }), data, 'subissues page').repository.issue;
+          return { anchor: `${repoKey(repo(issue.repository))}#${issue.number}`, connection: issue.subIssues };
+        },
+      });
+      source.subIssues = { ...source.subIssues, nodes };
+    }
+    if (source.closedByPullRequestsReferences.pageInfo.hasNextPage) {
+      const nodes = await drain({
+        label: `${anchor} closing PR links`, cause, first: source.closedByPullRequestsReferences, anchor,
+        next: after => selection(repository, `issue(number:${source.number}) { number repository { nameWithOwner } ${closedByPage(after)} }`),
+        read: data => {
+          const issue = decode(z.object({ repository: z.object({ issue: z.object({ ...sourceRefFields, closedByPullRequestsReferences: connection(sourceRef) }) }) }), data, 'closing PR links page').repository.issue;
+          return { anchor: `${repoKey(repo(issue.repository))}#${issue.number}`, connection: issue.closedByPullRequestsReferences };
+        },
+      });
+      source.closedByPullRequestsReferences = { ...source.closedByPullRequestsReferences, nodes };
+    }
+  }
+  async function completePrConnections(source: SourcePr, cause: string): Promise<void> {
+    const repository = repo(source.repository);
+    const anchor = `${repoKey(repository)}#${source.number}`;
+    if (source.closingIssuesReferences.pageInfo.hasNextPage) {
+      const nodes = await drain({
+        label: `${anchor} closing issues`, cause, first: source.closingIssuesReferences, anchor,
+        next: after => selection(repository, `pullRequest(number:${source.number}) { number ${closingRefsPage(after)} }`),
+        read: data => {
+          const pull = decode(z.object({ repository: z.object({ pullRequest: z.object({ number: positive, closingIssuesReferences: connection(sourceRef) }) }) }), data, 'closing issues page').repository.pullRequest;
+          return { anchor: `${repoKey(repository)}#${pull.number}`, connection: pull.closingIssuesReferences };
+        },
+      });
+      source.closingIssuesReferences = { ...source.closingIssuesReferences, nodes };
+    }
+    const rollup = source.statusCheckRollup;
+    // Checks are pinned to the first page's head: a page observed at a different
+    // headRefOid is refused instead of concatenated into one checks list.
+    if (rollup?.contexts.pageInfo.hasNextPage) {
+      const nodes = await drain({
+        label: `${anchor} checks`, cause, first: rollup.contexts, anchor: `${anchor}@${source.headRefOid}`,
+        next: after => selection(repository, `pullRequest(number:${source.number}) { number headRefOid ${contextsPage(source.number, after)} }`),
+        read: data => {
+          const pull = decode(z.object({ repository: z.object({ pullRequest: z.object({ number: positive, headRefOid: m.shaSchema, statusCheckRollup: z.object({ contexts: connection(sourceContext) }).nullable() }) }) }), data, 'PR checks page').repository.pullRequest;
+          const contexts = pull.statusCheckRollup?.contexts;
+          if (!contexts) return fail('invalidResponse', `${anchor} checks: status check rollup disappeared during pagination`);
+          return { anchor: `${repoKey(repository)}#${pull.number}@${pull.headRefOid}`, connection: contexts };
+        },
+      });
+      source.statusCheckRollup = { ...rollup, contexts: { ...rollup.contexts, nodes } };
+    }
+  }
+  async function completeBranchRules(repository: m.Repo, branch: z.infer<typeof sourceBranch>, cause: string): Promise<void> {
+    if (!branch.rules.pageInfo.hasNextPage) return;
+    const label = `branch rules ${repoKey(repository)} ${branch.name}`;
+    const nodes = await drain({
+      label, cause, first: branch.rules, anchor: `${branch.name}@${branch.target.oid}`,
+      // A branch's rules are properties of the branch, so the follow-up pins the
+      // exact ref name and head commit instead of re-resolving a moving default.
+      next: after => selection(repository, `ref(qualifiedName:${quote(`refs/heads/${branch.name}`)}) { name target { oid } ${rulesPage(after)} }`),
+      read: data => {
+        const source = decode(z.object({ repository: z.object({ ref: z.object({ name: z.string().min(1), target: z.object({ oid: m.shaSchema }), rules: connection(rule) }).nullable() }) }), data, 'branch rules page').repository.ref;
+        if (source === null) return fail('invalidResponse', `${label}: branch no longer exists during pagination`);
+        return { anchor: `${source.name}@${source.target.oid}`, connection: source.rules };
+      },
+    });
+    branch.rules = { ...branch.rules, nodes };
+  }
   async function collect(scope: m.SourceScope, cause: string): Promise<m.Facts> {
     const issues: m.IssueSnapshot[] = [], prs: m.PrSnapshot[] = [], links: m.Facts['links'] = [], repos: m.RepoSnapshot[] = [], branches: m.BranchSnapshot[] = [], maintenance: m.MaintenanceObservation[] = [];
     const sources: SourcePr[] = [];
@@ -278,7 +378,7 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
       const key = repoKey(repository);
       if (!repositoryReads.has(key)) repositoryReads.set(key, { repo: repository, bases: new Set<string>() });
     }
-    const tasks: { query: string; consume: (value: unknown) => void }[] = [];
+    const tasks: { query: string; consume: (value: unknown) => void | Promise<void> }[] = [];
     function addBranch(repository: m.Repo, name: string, source: z.infer<typeof sourceBranch> | null, isDefault: boolean): void {
       if (source !== null && source.name !== name) fail('invalidResponse', `Branch identity mismatch: requested ${name}, received ${source.name}`);
       const existing = branches.find(item => repoKey(item.repo) === repoKey(repository) && item.name === name);
@@ -302,31 +402,38 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
     for (const read of [...repositoryReads.values()].sort((left, right) => repoKey(left.repo).localeCompare(repoKey(right.repo)))) {
       const bases = [...read.bases].sort();
       const fields = `${repoFields} ${bases.map((name, index) => `b${index}:ref(qualifiedName:${quote(`refs/heads/${name}`)}) { ${branchFields} }`).join('\n')}`;
-      tasks.push({ query: selection(read.repo, fields), consume: value => {
+      tasks.push({ query: selection(read.repo, fields), consume: async value => {
         const source = decode(sourceRepo.passthrough(), value, 'repository');
-        if (repoKey(repo(source)) !== repoKey(read.repo)) fail('invalidResponse', 'Repository identity mismatch');
+        const identity = repo(source);
+        if (repoKey(identity) !== repoKey(read.repo)) fail('invalidResponse', 'Repository identity mismatch');
+        await completeBranchRules(identity, source.defaultBranchRef, cause);
+        const requested = bases.map((name, index) => ({ name, branch: decode(sourceBranch.nullable(), source[`b${index}`], `requested base ${name}`) }));
+        for (const item of requested) if (item.branch) await completeBranchRules(identity, item.branch, cause);
         addRepo(source);
-        bases.forEach((name, index) => {
-          const branch = decode(sourceBranch.nullable(), source[`b${index}`], `requested base ${name}`);
-          addBranch(repo(source), name, branch, name === source.defaultBranchRef.name);
-        });
+        for (const item of requested) addBranch(identity, item.name, item.branch, item.name === source.defaultBranchRef.name);
       } });
     }
-    for (const wanted of scope.issues) tasks.push({ query: selection(wanted.repo, `issue(number:${wanted.number}) { ${issueFields} }`), consume: value => {
+    for (const wanted of scope.issues) tasks.push({ query: selection(wanted.repo, `issue(number:${wanted.number}) { ${issueFields} }`), consume: async value => {
       const item = decode(z.object({ issue: issueRead }), value, 'issue').issue;
       if (refKey(ref(item)) !== refKey(wanted)) fail('invalidResponse', 'Issue identity mismatch');
+      await completeIssueConnections(item, cause);
       issues.push(issueSnapshot(item));
       for (const linked of item.closedByPullRequestsReferences.nodes) { const pr = ref(linked); wantedPrs.set(refKey(pr), pr); links.push({ issue: ref(item), pr }); }
     } });
-    for (const wanted of scope.branches) tasks.push({ query: selection(wanted.repo, `ref(qualifiedName:${quote(`refs/heads/${wanted.name}`)}) { ${branchFields} }`), consume: value => {
+    for (const wanted of scope.branches) tasks.push({ query: selection(wanted.repo, `ref(qualifiedName:${quote(`refs/heads/${wanted.name}`)}) { ${branchFields} }`), consume: async value => {
       const source = decode(z.object({ ref: sourceBranch.nullable() }), value, 'branch').ref;
+      if (source !== null) await completeBranchRules(wanted.repo, source, cause);
       const defaultBranch = repos.find(item => repoKey(item.repo) === repoKey(wanted.repo))?.defaultBranch;
       addBranch(wanted.repo, wanted.name, source, defaultBranch === wanted.name);
     } });
     const queried = new Set<string>();
-    const prTask = (wanted: m.PrRef) => ({ query: selection(wanted.repo, `pullRequest(number:${wanted.number}) { ${prFields(wanted.number)} }`), consume: (value: unknown) => {
+    const prTask = (wanted: m.PrRef) => ({ query: selection(wanted.repo, `pullRequest(number:${wanted.number}) { ${prFields(wanted.number)} }`), consume: async (value: unknown) => {
       const source = decode(z.object({ pullRequest: sourcePr }), value, 'pull request').pullRequest;
       if (refKey(ref(source)) !== refKey(wanted)) fail('invalidResponse', 'PR identity mismatch');
+      await completePrConnections(source, cause);
+      await completeBranchRules(repo(source.repository), source.repository.defaultBranchRef, cause);
+      await completeBranchRules(repo(source.baseRepository), source.baseRepository.defaultBranchRef, cause);
+      if (source.baseRef) await completeBranchRules(repo(source.baseRepository), source.baseRef, cause);
       sources.push(source); queried.add(refKey(wanted));
     } });
     tasks.push(...scope.prs.map(prTask));
@@ -336,13 +443,12 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
       const viewer = decode(z.object({ login: z.string().min(1) }), data.viewer, 'viewer');
       if (options.actor && options.actor.toLowerCase() !== viewer.login.toLowerCase()) fail('permission', 'Configured actor differs from authenticated source viewer');
       actor = viewer.login;
-      items.forEach((item, index) => item.consume(data[`a${index}`]));
+      for (const [index, item] of items.entries()) await item.consume(data[`a${index}`]);
     }
     let actor = '';
     await batch(tasks);
     await batch([...wantedPrs.values()].filter(item => !queried.has(refKey(item))).map(prTask));
     for (const source of sources) {
-      complete(source.closingIssuesReferences, 'closing issues');
       addRepo(source.repository); addRepo(source.baseRepository);
       const targetRepo = repo(source.baseRepository), headRepo = repo(source.headRepository);
       addBranch(targetRepo, source.baseRefName, source.baseRef, source.baseRefName === source.baseRepository.defaultBranchRef.name);
@@ -472,6 +578,7 @@ export function createGitHubPort(options: { actor?: string } = {}): GitHubPort {
     const data = await graph(`query { ${selection(reference.repo, `issue(number:${reference.number}) { ${issueFields} }`)} }`, cause);
     const source = decode(z.object({ repository: z.object({ issue: issueRead }) }), data, 'issue').repository.issue;
     if (refKey(ref(source)) !== refKey(reference)) fail('invalidResponse', 'Issue identity mismatch');
+    await completeIssueConnections(source, cause);
     return issueSnapshot(source);
   }
   async function preflightPr(input: PrWrite): Promise<void> {

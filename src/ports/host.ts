@@ -1,256 +1,189 @@
-import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
-import { promisify } from 'node:util';
-import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
-import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from '@oh-my-pi/pi-coding-agent/registry/agent-registry';
-import { AgentLifecycleManager } from '@oh-my-pi/pi-coding-agent/registry/agent-lifecycle';
-import { discoverAgents, getAgent } from '@oh-my-pi/pi-coding-agent/task/discovery';
-import { cfgTaskIsolationEnabled } from '@oh-my-pi/pi-coding-agent/task/settings';
-import { cfgAsyncEnabled } from '@oh-my-pi/pi-coding-agent/tools/settings';
-import type { Caller, HostObservation, HostSeat, PortError, Result, SeatRequest } from '../domain/model.ts';
-import type { DeliveryReceipt, HostPort, WakeInput } from './contracts.ts';
+import {execFile} from 'node:child_process';
+import {randomUUID} from 'node:crypto';
+import {mkdir,mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {basename,dirname,join,resolve,sep} from 'node:path';
+import {promisify} from 'node:util';
+import {createAgentSession,z,type AgentSession,type ExtensionContext} from '@oh-my-pi/pi-coding-agent';
+import type {ToolDefinition} from '@oh-my-pi/pi-coding-agent/extensibility/extensions/types';
+import {AgentRegistry,MAIN_AGENT_ID} from '@oh-my-pi/pi-coding-agent/registry/agent-registry';
+import {SessionManager} from '@oh-my-pi/pi-coding-agent/session/session-manager';
+import {discoverAgents,getAgent} from '@oh-my-pi/pi-coding-agent/task/discovery';
+import {cfgTaskAgentModelOverrides,cfgTaskDisabledAgents} from '@oh-my-pi/pi-coding-agent/task/settings';
+import {resolveAgentModelSelection} from '@oh-my-pi/pi-coding-agent/config/model-resolver';
+import {initializeExtensions} from '@oh-my-pi/pi-coding-agent/modes/runtime-init';
+import {buildPublicGrammar} from '../domain/public-grammar.ts';
+import {parseToolParameters} from '../domain/parse.ts';
+import type {Caller,PortError,PortInput,Result} from '../domain/model.ts';
+import type {HostPort,SeatLaunch} from './contracts.ts';
+import type {ControllerOutput,RuntimeError} from '../runtime/controller.ts';
 
-const runFile = promisify(execFile);
-type SessionManager = ExtensionContext['sessionManager'];
-type Binding = { caller: Caller; manager: SessionManager; status: 'bound' | 'released' };
-type Preflight = HostObservation['preflight'];
-type Message = HostObservation['turnEnds'][number];
-type Validated = { manager: SessionManager; result: Preflight };
+const runFile=promisify(execFile);
+const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string())}).strict();
+const handoffSchema=z.object({ticketId:z.string(),notes:z.number().int().nonnegative(),rulings:z.number().int().nonnegative()}).strict();
+type LiveSeat={input:SeatLaunch;session:AgentSession|null;done:Promise<void>};
+export type HostOptions={sessionDir:string;execute:(caller:Caller,input:PortInput,cwd:string)=>Promise<Result<ControllerOutput,RuntimeError>>;onExit:(ticketId:string,handedOff:boolean,error:string|null)=>void};
 
-function failure(kind: Exclude<PortError['kind'], 'rateLimited'>, message: string): { ok: false; error: PortError } {
-  return { ok: false, error: { kind, message } };
-}
-
-function sourceError(prefix: string, error: unknown, kind: 'unavailable' | 'uncertainOutcome' = 'unavailable'): { ok: false; error: PortError } {
-  const detail = error instanceof Error ? error.message : 'Native host operation failed';
-  const sanitized = detail
-    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, '$1 [redacted]')
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[redacted]')
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@');
-  return failure(kind, `${prefix}: ${sanitized}`);
-}
-
-function sameCaller(a: Caller, b: Caller): boolean {
-  return a.agentId === b.agentId && a.sessionId === b.sessionId && a.parentId === b.parentId
-    && a.runId === b.runId && a.kind === b.kind && a.depth === b.depth;
-}
-
-function sameRequest(a: SeatRequest, b: SeatRequest, revivedSessionId: string): boolean {
-  if (a.binding.kind !== 'bound' || b.binding.kind !== 'bound') return false;
-  return a.id === b.id && a.runId === b.runId && a.name === b.name && a.role === b.role
-    && JSON.stringify(a.context) === JSON.stringify(b.context)
-    && a.binding.agentId === b.binding.agentId
-    && (a.binding.sessionId === b.binding.sessionId || b.binding.sessionId === revivedSessionId)
-    && a.binding.parentId === b.binding.parentId;
-}
-
-function requestMatches(request: SeatRequest, input: WakeInput, binding: Binding): boolean {
-  const holder = request.binding;
-  const contextMatches = request.role === 'postMerge' ? request.context.kind === 'unit'
-    : request.role === 'closure' ? request.context.kind === 'agenda' : request.context.kind === 'member';
-  // The native allocator preserves the exact requested id, adding only -2, -3, ... on collision.
-  const nameMatches = input.agentId === request.name
-    || (input.agentId.startsWith(`${request.name}-`) && /^[2-9]\d*$|^1\d+$/.test(input.agentId.slice(request.name.length + 1)));
-  return contextMatches && nameMatches && request.id === input.requestId && request.runId === input.runId
-    && holder.kind === 'bound' && holder.agentId === input.agentId && holder.parentId === input.parentId
-    && holder.sessionId === binding.caller.sessionId && binding.caller.agentId === input.agentId
-    && binding.caller.runId === input.runId && binding.caller.parentId === input.parentId
-    && binding.caller.kind === 'sub' && binding.caller.depth === 1;
-}
-
-/** Native registry/session objects remain authoritative; only local identity indexes live here. */
-export function createHostPort(readRequest: (requestId: string) => SeatRequest | undefined): HostPort {
-  const registry = AgentRegistry.global();
-  const lifecycle = AgentLifecycleManager.global();
-  const bindings = new Map<string, Binding>();
-  let sessionIds = new WeakMap<SessionManager, string>();
-  const messages = new Map<string, Message>();
-  const turnEnds = new Map<string, Message>();
-  let validated: Validated | undefined;
-  let disposed = false;
-
-  function sessionId(manager: SessionManager): string {
-    let id = sessionIds.get(manager);
-    if (!id) { id = randomUUID(); sessionIds.set(manager, id); }
-    return id;
+/** Owns only the sessions it creates; the native registry owns their identities. */
+export function createHostPort(options:HostOptions):HostPort {
+  const registry=AgentRegistry.global();
+  const seats=new Map<string,LiveSeat>();
+  let disposed=false;
+  function main():AgentSession {
+    const root=registry.get(MAIN_AGENT_ID);
+    if(!root?.session||root.kind!=='main'||root.status==='aborted')throw new Error('The native Main session is unavailable');
+    return root.session;
   }
-
-  function depthOf(ref: AgentRef): number | undefined {
-    const seen = new Set<string>();
-    let current: AgentRef | undefined = ref;
-    let depth = 0;
-    while (current?.kind !== 'main') {
-      if (!current || seen.has(current.id) || current.kind !== 'sub' || !current.parentId) return undefined;
-      seen.add(current.id);
-      current = registry.get(current.parentId);
-      depth++;
-    }
-    return current.id === MAIN_AGENT_ID ? depth : undefined;
-  }
-
-  function mainSession(): Result<NonNullable<AgentRef['session']>, PortError> {
-    if (disposed) return failure('unavailable', 'Native HostPort has been disposed');
-    const ref = registry.get(MAIN_AGENT_ID);
-    const binding = bindings.get(MAIN_AGENT_ID);
-    if (!ref || ref.kind !== 'main' || ref.status === 'aborted' || !ref.session
-      || !binding || binding.status !== 'bound' || binding.manager !== ref.session.sessionManager)
-      return failure('precondition', 'The current Main native session is not bound');
-    return { ok: true, value: ref.session };
-  }
-
-  function settingsPreflight(session: NonNullable<AgentRef['session']>): Result<null, PortError> {
-    if (!lifecycle.manages(registry)) return failure('precondition', 'Native lifecycle does not own the current registry');
-    if (cfgAsyncEnabled.get(session.settings) !== true) return failure('precondition', 'Main async.enabled must be true');
-    if (session.asyncJobManager === undefined) return failure('precondition', 'Main native async job manager is unavailable');
-    if (cfgTaskIsolationEnabled.get(session.settings) !== true) return failure('precondition', 'Main task isolation must be true');
-    if (session.getPlanModeState()?.enabled === true) return failure('precondition', 'Main plan mode cannot convene isolated execution');
-    return { ok: true, value: null };
-  }
-
-  function currentPreflight(): Preflight {
-    const main = mainSession();
-    if (!main.ok) return main;
-    const settings = settingsPreflight(main.value);
-    if (!settings.ok) return settings;
-    if (!validated || validated.manager !== main.value.sessionManager)
-      return failure('precondition', 'Main cwd and effective seat agents have not been validated for this native session');
-    return validated.result;
-  }
-
   return {
-    bind(ctx, runId) {
-      try {
-        if (disposed) return failure('unavailable', 'Native HostPort has been disposed');
-        const ref = registry.get(ctx.agent.id);
-        if (!ref || ref.kind === 'advisor' || ref.status === 'aborted' || !ref.session
-          || ref.session.sessionManager !== ctx.sessionManager || ref.kind !== ctx.agent.kind)
-          return failure('precondition', 'Caller does not match the current native registry session');
-        const depth = depthOf(ref);
-        if (depth === undefined || depth !== ctx.agent.depth)
-          return failure('precondition', 'Caller does not belong to the current native Main agent tree');
-        const caller: Caller = { agentId: ref.id, sessionId: sessionId(ctx.sessionManager), parentId: ref.parentId ?? null, runId, kind: ref.kind, depth };
-        const previous = bindings.get(ref.id);
-        if (previous && previous.caller.runId !== runId) { messages.delete(ref.id); turnEnds.delete(ref.id); }
-        bindings.set(ref.id, { caller, manager: ctx.sessionManager, status: 'bound' });
-        return { ok: true, value: caller };
-      } catch (error) { return sourceError('Cannot bind native session', error); }
+    bind(ctx){
+      const ref=registry.get(ctx.agent.id);
+      if(!ref?.session||ref.session.sessionManager!==ctx.sessionManager)return {ok:false,error:{kind:'precondition',message:'Caller is not the current native session'}};
+      if(ref.id===MAIN_AGENT_ID&&ref.kind==='main')return {ok:true,value:{kind:'main',agentId:ref.id,sessionId:ctx.sessionManager.getSessionId(),sessionFile:ctx.sessionManager.getSessionFile()??null}};
+      const seat=seats.get(ref.id),file=ctx.sessionManager.getSessionFile();
+      if(!seat||seat.session!==ref.session||!file)return {ok:false,error:{kind:'precondition',message:'Caller is not a one-shot ticket seat'}};
+      return {ok:true,value:{kind:'seat',agentId:ref.id,sessionId:ctx.sessionManager.getSessionId(),sessionFile:file,ticketId:seat.input.ticketId,revision:seat.input.revision,role:seat.input.role}};
     },
-    release(ctx) {
-      const binding = bindings.get(ctx.agent.id);
-      if (!binding || binding.manager !== ctx.sessionManager) return;
-      // Keep only the last identity for authorization of this holder's legitimate parked revival.
-      binding.status = 'released';
-      if (ctx.agent.id === MAIN_AGENT_ID) validated = undefined;
-    },
-    observe(runId, main) {
+    active(ticketId,role){return [...seats.values()].some(seat=>seat.input.ticketId===ticketId&&seat.input.role===role);},
+    async launch(input){
+      if(disposed)return {ok:false,error:{kind:'precondition',message:'Seat host has shut down'}};
+      if([...seats.values()].some(seat=>seat.input.ticketId===input.ticketId&&seat.input.role===input.role))return {ok:false,error:{kind:'precondition',message:'Ticket role already has a live session'}};
+      const id=`Rt${randomUUID().replaceAll('-','')}`;
+      // This is a lifecycle reservation, not an observation of a native session.
+      const seat:LiveSeat={input,session:null,done:Promise.resolve()};seats.set(id,seat);
+      let manager:SessionManager|undefined,workspace:string|undefined,ephemeralWorkspace=false;
       try {
-        const actualMain = mainSession();
-        if (!actualMain.ok) return actualMain;
-        const binding = bindings.get(MAIN_AGENT_ID);
-        if (!binding || main.runId !== runId || !sameCaller(binding.caller, main))
-          return failure('precondition', 'Observation Main/run does not match the bound native session');
-        const seats: HostSeat[] = registry.list().filter(ref => ref.kind !== 'advisor').map(ref => ({
-          agentId: ref.id,
-          requestedName: ref.id,
-          parentId: ref.parentId ?? null,
-          sessionId: ref.session ? sessionId(ref.session.sessionManager) : null,
-          createdAt: ref.createdAt,
-          status: ref.status,
-          plan: ref.session ? ref.session.getPlanModeState()?.enabled === true ? 'enabled' : 'disabled' : 'unavailable',
-          streaming: ref.session?.isStreaming ?? false,
-        }));
-        return { ok: true, value: { runId, main, seats, turnEnds: [...turnEnds.values()].filter(end => end.runId === runId), preflight: currentPreflight() } };
-      } catch (error) { return sourceError('Cannot observe native registry', error); }
-    },
-    async validate(cwd, agents) {
-      const main = mainSession();
-      if (!main.ok) return main;
-      const manager = main.value.sessionManager;
-      validated = undefined;
-      try {
-        const settings = settingsPreflight(main.value);
-        if (!settings.ok) { validated = { manager, result: settings }; return settings; }
-        if (resolve(cwd) !== resolve(manager.getCwd())) return failure('precondition', 'Requested Git cwd differs from the actual Main session cwd');
-        const git = await runFile('git', ['-C', cwd, 'rev-parse', '--is-inside-work-tree'], { encoding: 'utf8' });
-        if (git.stdout.trim() !== 'true') return failure('precondition', 'Main cwd is not a Git working tree');
-        const discovery = await discoverAgents(cwd, undefined, main.value.effectiveExtensionRoots);
-        const effectiveAgents = [...discovery.agents, ...main.value.getSessionAgents()];
-        const accepted: { name: string; blocking: false }[] = [];
-        for (const name of new Set(agents)) {
-          const agent = getAgent(effectiveAgents, name);
-          if (!agent) return failure('precondition', `Configured seat agent is not available through native discovery: ${name}`);
-          if (agent.blocking === true) return failure('precondition', `Configured seat agent is blocking: ${name}`);
-          accepted.push({ name, blocking: false });
+        const parent=main();
+        if(!parent.asyncJobManager)throw new Error('Roundtable requires the native async job manager');
+        if(parent.getPlanModeState()?.enabled)throw new Error('Roundtable seats require an executing Main');
+        const discovery=await discoverAgents(input.cwd,undefined,parent.effectiveExtensionRoots);
+        const agent=getAgent([...discovery.agents,...parent.getSessionAgents()],input.agent);
+        if(!agent||cfgTaskDisabledAgents.get(parent.settings).includes(input.agent))throw new Error(`Configured seat agent is unavailable: ${input.agent}`);
+        if(agent.blocking)throw new Error('Roundtable requires a nonblocking seat agent');
+        await mkdir(options.sessionDir,{recursive:true,mode:0o700});
+        if(input.sourceSessionFile){
+          if(input.role!=='owner')throw new Error('Gate sessions must never inherit history');
+          const prior=await SessionManager.peekSessionInit(input.sourceSessionFile);
+          if(!prior)throw new Error('Owner fork source has no native session contract');
+          workspace=prior.cwd;
+          manager=await SessionManager.forkFrom(input.sourceSessionFile,workspace,options.sessionDir,undefined,{copyArtifacts:false,suppressBreadcrumb:true});
+        }else{
+          const root=await mkdtemp(join(tmpdir(),'roundtable-seat-'));
+          workspace=join(root,'repo');ephemeralWorkspace=input.role!=='owner';
+          await runFile('gh',['repo','clone',`${input.workspace.repo.owner}/${input.workspace.repo.name}`,workspace,'--','--quiet'],{cwd:input.cwd});
+          await runFile('git',['checkout','--detach',`origin/${input.workspace.base}`],{cwd:workspace});
+          manager=SessionManager.create(workspace,options.sessionDir);
+          await manager.ensureOnDisk();
         }
-        const current = mainSession();
-        if (!current.ok) return current;
-        if (current.value !== main.value) return failure('precondition', 'Main native session changed during preflight');
-        const fresh = settingsPreflight(current.value);
-        if (!fresh.ok) return fresh;
-        const result: Preflight = { ok: true, value: { asyncEnabled: true, isolationEnabled: true, asyncManager: true, gitCwd: resolve(cwd), agents: accepted } };
-        validated = { manager, result };
-        return result;
-      } catch (error) {
-        const result = sourceError('Native preflight failed', error);
-        validated = { manager, result };
-        return result;
+        const sessionFile=manager.getSessionFile();if(!sessionFile)throw new Error('Native seat session must be persistent');
+        let inheritedContract:unknown,previousHandoff:unknown;
+        for(const entry of manager.getEntries())if(entry.type==='custom'){
+          if(entry.customType==='roundtable-session-contract')inheritedContract=entry.data;
+          if(entry.customType==='roundtable-handoff')previousHandoff=entry.data;
+        }
+        const savedContract=contractSchema.safeParse(inheritedContract);
+        if(input.sourceSessionFile&&!savedContract.success)throw new Error('Owner session is missing its original prompt/tool contract');
+        const handoff=handoffSchema.safeParse(previousHandoff);
+        if(input.sourceSessionFile&&(!handoff?.success||handoff.data.ticketId!==input.ticketId))throw new Error('Owner fork source does not contain this ticket’s accepted handoff');
+        let handedOff=false;
+        const caller:Caller={kind:'seat',agentId:id,sessionId:manager.getSessionId(),sessionFile,ticketId:input.ticketId,revision:input.revision,role:input.role};
+        const nativeManager=manager;
+        const tool:ToolDefinition={name:'roundtable',label:'Roundtable',description:'Read or hand off only your bound ticket. A successful submit/verdict/escalate ends this seat.',parameters:buildPublicGrammar(z).toolParametersSchema,
+            async execute(_id,params){
+              if(handedOff)return {content:[{type:'text',text:'This seat has already handed off.'}],details:null,isError:true};
+              const current=registry.get(id);
+              if(!current?.session||current.session!==seat.session)return {content:[{type:'text',text:'Native seat identity changed.'}],details:null,isError:true};
+              const parsed=parseToolParameters(params);
+              if(!parsed.ok)return {content:[{type:'text',text:JSON.stringify(parsed.error)}],details:null,isError:true};
+              const response=await options.execute(caller,parsed.value.input,workspace!);
+              if(response.ok&&['submit','verdict','escalate'].includes(parsed.value.input.op)){
+                handedOff=true;
+                if(input.role==='owner'&&'ticket' in response.value&&'ownerSessionFile' in response.value.ticket){
+                  nativeManager.appendCustomEntry('roundtable-handoff',{ticketId:input.ticketId,notes:response.value.ticket.notes.length,rulings:response.value.ticket.rulings.length});
+                }
+              }
+              return {content:[{type:'text',text:JSON.stringify(response)}],details:response,isError:!response.ok};
+            },
+        };
+        const tools=savedContract?.success?savedContract.data.tools:[...new Set([...(agent.tools??parent.getEnabledToolNames()).filter(name=>!['roundtable','task','fork_task','todo','ask','schedule'].includes(name)),'roundtable'])];
+        const override=cfgTaskAgentModelOverrides.get(parent.settings)[input.agent];
+        const modelPattern=parent.model?`${parent.model.provider}/${parent.model.id}`:undefined;
+        const modelSelection=resolveAgentModelSelection({settings:parent.settings,
+          ...(override!==undefined?{settingsOverride:override}:{}),
+          ...(agent.model!==undefined?{agentModel:agent.model}:{}),
+          ...(modelPattern!==undefined?{activeModelPattern:modelPattern,fallbackModelPattern:modelPattern}:{}),
+        });
+        const cacheKey=manager.getHeader()?.providerPromptCacheKey??manager.getHeader()?.id;
+        const created=await createAgentSession({cwd:workspace,sessionManager:manager,authStorage:parent.modelRegistry.authStorage,modelRegistry:parent.modelRegistry,
+          credentialSourceSessionId:parent.sessionManager.getSessionId(),settings:parent.settings,
+          ...(!input.sourceSessionFile&&modelSelection.patterns?{modelPattern:modelSelection.patterns}:{}),
+          ...(input.sourceSessionFile&&cacheKey?{providerPromptCacheKey:cacheKey,providerPromptCacheKeySource:'fork' as const}:{}),
+          ...(savedContract.success?{systemPrompt:savedContract.data.systemPrompt}:{appendSystemPrompt:agent.systemPrompt}),
+          customTools:[tool],disableExtensionDiscovery:true,toolNames:tools,restrictToolNames:true,allowRestrictedCustomTools:true,
+          hasUI:false,bindProcessState:false,cacheWarming:false,enableIrc:false,enableMCP:false,
+          agentId:id,agentName:agent.name,agentDisplayName:`${input.role}: ${input.ticketId}`,parentAgentId:MAIN_AGENT_ID,parentTaskPrefix:id,taskDepth:1,expectedAgentRef:null,
+          spawns:'',inheritedSessionAgents:parent.getSessionAgents(),
+        });
+        seat.session=created.session;
+        if(!input.sourceSessionFile){
+          manager.appendCustomEntry('roundtable-session-contract',{systemPrompt:created.session.systemPrompt,tools});
+          manager.appendSessionInit({systemPrompt:created.session.systemPrompt.join('\n\n'),task:input.prompt,tools,agent:agent.name,readOnly:input.role!=='owner',spawns:''});
+        }
+        await initializeExtensions(created.session,{reportSendError:(_action,error)=>options.onExit(input.ticketId,false,error.message),reportRuntimeError:error=>options.onExit(input.ticketId,false,error.error)});
+        const prompt=input.sourceSessionFile&&handoff?.success
+          ? `Continue ticket ${input.ticketId} at revision ${input.revision}. Only the incremental handoff follows. Call roundtable read if the current contract or PR is needed.\n${JSON.stringify({notes:input.ticket.notes.slice(handoff.data.notes),rulings:input.ticket.rulings.slice(handoff.data.rulings)})}`
+          : input.prompt;
+        const session=created.session,ownedWorkspace=workspace,cleanupWorkspace=ephemeralWorkspace;
+        const completion=Promise.withResolvers<void>();
+        seat.done=completion.promise;
+        const jobId=parent.asyncJobManager.register('task',`${input.role}: ${input.ticketId}`,async({signal})=>{
+          const abort=()=>{void session.abort();};
+          signal.addEventListener('abort',abort,{once:true});
+          let error:string|null=null;
+          try {
+            if(signal.aborted)throw new Error('Seat was cancelled before dispatch');
+            await session.prompt(prompt);
+            return handedOff?`Ticket ${input.ticketId} handed off.`:`Ticket ${input.ticketId} exited without handoff.`;
+          }catch(cause){
+            error=cause instanceof Error?cause.message:String(cause);
+            throw cause;
+          }finally {
+            signal.removeEventListener('abort',abort);
+            try {await session.dispose();}catch(cause){error??=cause instanceof Error?cause.message:String(cause);}
+            seats.delete(id);
+            try {
+              if(cleanupWorkspace)await rm(join(ownedWorkspace,'..'),{recursive:true,force:true});
+            }catch(cause){error??=cause instanceof Error?cause.message:String(cause);}
+            finally {options.onExit(input.ticketId,handedOff,error);completion.resolve();}
+          }
+        },{ownerId:MAIN_AGENT_ID,agentId:id});
+        return {ok:true,value:{agentId:id,sessionFile,jobId}};
+      }catch(error){
+        seats.delete(id);
+        if(seat.session)await seat.session.dispose();else if(manager)await manager.close();
+        if(workspace&&ephemeralWorkspace)await rm(join(workspace,'..'),{recursive:true,force:true});
+        const detail:PortError={kind:'unavailable',message:error instanceof Error?error.message:String(error)};
+        return {ok:false,error:detail};
       }
     },
-    async wake(input) {
-      let deliveryStarted = false;
+    async finish(files){
       try {
-        if (disposed) return failure('unavailable', 'Native HostPort has been disposed');
-        const main = mainSession();
-        if (!main.ok) return main;
-        const mainBinding = bindings.get(MAIN_AGENT_ID);
-        const request = readRequest(input.requestId);
-        const binding = bindings.get(input.agentId);
-        const ref = registry.get(input.agentId);
-        if (!mainBinding || mainBinding.caller.runId !== input.runId || input.parentId !== MAIN_AGENT_ID
-          || !request || !binding || !requestMatches(request, input, binding)
-          || !ref || ref.kind !== 'sub' || ref.parentId !== input.parentId || ref.status === 'aborted')
-          return failure('precondition', 'Wake does not match the current accepted native request/run/parent/holder binding');
-        if (ref.session && (binding.status !== 'bound' || ref.session.sessionManager !== binding.manager))
-          return failure('precondition', 'Wake holder session differs from the accepted bound native session');
-        if (!ref.session && ref.status !== 'parked')
-          return failure('precondition', 'Wake holder has no live session and is not parked');
-        const target = await lifecycle.ensureLive(input.agentId);
-        const targetSessionId = sessionId(target.sessionManager);
-        const freshRef = registry.get(input.agentId);
-        const freshRequest = readRequest(input.requestId);
-        const freshMain = mainSession();
-        if (!freshMain.ok) return freshMain;
-        if (disposed || !freshRequest || !sameRequest(request, freshRequest, targetSessionId) || freshRef !== ref
-          || freshRef.parentId !== input.parentId || freshRef.status === 'aborted' || freshRef.session !== target
-          || bindings.get(MAIN_AGENT_ID)?.caller.runId !== input.runId)
-          return failure('precondition', 'Native holder/request ownership changed while ensuring the session is live');
-        // No asynchronous gap is allowed between this real-session precheck and direct delivery.
-        if (target.getPlanModeState()?.enabled === true && !target.isStreaming)
-          return failure('precondition', 'Native wake target is idle in plan mode');
-        const message: Message = { agentId: input.agentId, runId: input.runId, messageId: input.messageId };
-        messages.set(input.agentId, message);
-        turnEnds.delete(input.agentId);
-        deliveryStarted = true;
-        const outcome = await target.deliverIrcMessage({ id: input.messageId, from: MAIN_AGENT_ID, to: input.agentId, body: input.body, ts: input.startedAt });
-        if (outcome !== 'injected' && outcome !== 'woken') return failure('uncertainOutcome', 'Native direct delivery returned an invalid receipt');
-        const receipt: DeliveryReceipt = { agentId: input.agentId, messageId: input.messageId, outcome };
-        return { ok: true, value: receipt };
-      } catch (error) { return sourceError('Native wake failed', error, deliveryStarted ? 'uncertainOutcome' : 'unavailable'); }
+        for(const file of files){
+          if(!resolve(file).startsWith(`${resolve(options.sessionDir)}${sep}`))throw new Error('Owner session is outside the owned session directory');
+          const prior=await SessionManager.peekSessionInit(file);
+          if(!prior)throw new Error(`Cannot inspect Owner workspace for ${file}`);
+          const root=dirname(prior.cwd);
+          if(basename(prior.cwd)!=='repo'||!basename(root).startsWith('roundtable-seat-')||root!==join(tmpdir(),basename(root)))throw new Error('Refusing to remove a workspace not created by this seat host');
+          await rm(root,{recursive:true,force:true});
+        }
+        return {ok:true,value:null};
+      }catch(error){return {ok:false,error:{kind:'unavailable',message:error instanceof Error?error.message:String(error)}};}
     },
-    noteTurnEnd(agentId, runId, messageId) {
-      const current = messages.get(agentId);
-      const binding = bindings.get(agentId);
-      if (disposed || !current || current.runId !== runId || current.messageId !== messageId || binding?.caller.runId !== runId) return;
-      turnEnds.set(agentId, current);
-    },
-    dispose() {
-      disposed = true;
-      bindings.clear();
-      sessionIds = new WeakMap();
-      messages.clear();
-      turnEnds.clear();
-      validated = undefined;
+    async dispose(){
+      disposed=true;
+      const live=[...seats.values()];
+      for(const seat of live)if(seat.session)await seat.session.abort();
+      await Promise.all(live.map(seat=>seat.done));
+      seats.clear();
     },
   };
 }
