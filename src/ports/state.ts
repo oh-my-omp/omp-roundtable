@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import { z } from '@oh-my-pi/omptype/zod';
 import { agendaIdSchema } from '../domain/model.ts';
 import type { Agenda, AgendaId, Result } from '../domain/model.ts';
@@ -30,7 +30,7 @@ function decode(contents: string, id: AgendaId): StateResult<Agenda> {
     return failure('corruptState', `Agenda ${id}: invalid JSON`);
   }
   if (typeof value === 'object' && value !== null && 'format' in value
-    && typeof value.format === 'number' && Number.isInteger(value.format) && value.format !== 3) {
+    && typeof value.format === 'number' && Number.isInteger(value.format) && value.format !== 4) {
     return failure('unsupportedFormat', `Agenda ${id}: unsupported format ${value.format}`);
   }
   const parsed = envelopeSchema.safeParse(value);
@@ -56,17 +56,10 @@ export function createAgendaFiles(dataDir: string, metrics?: FileMetrics): Agend
   let preparation: Promise<void> | undefined;
   async function prepareDirectory(): Promise<void> {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    let current = await realpath(directory);
-    for (;;) {
-      await syncDirectory(current);
-      const parent = dirname(current);
-      if (parent === current) return;
-      current = parent;
-    }
+    await syncDirectory(directory);
   }
   function prepare(): Promise<void> {
-    // This port owns directory creation. Complete its durability once per
-    // instance; a failed initialization must repeat the entire ancestor chain.
+    // This port prepares only its own state directory. Failed preparation can retry.
     return preparation ??= prepareDirectory().catch(error => {
       preparation = undefined;
       throw error;
@@ -114,7 +107,7 @@ export function createAgendaFiles(dataDir: string, metrics?: FileMetrics): Agend
     const state = parsed.value;
     const target = join(directory, `${state.id}.json`);
     // Capture the complete target once, before any I/O. Retrying never recomputes a transition.
-    const contents = `${JSON.stringify({ format: 3, state })}\n`;
+    const contents = `${JSON.stringify({ format: 4, state })}\n`;
     const previous = await load(state.id);
     if (!previous.ok && previous.error.kind !== 'notFound') return previous;
 

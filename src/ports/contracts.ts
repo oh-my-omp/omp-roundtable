@@ -1,5 +1,5 @@
-import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
-import type { Agenda, AgendaId, Caller, CheckAttempt, CreatedIssueObservation, Facts, HostObservation, IssueRef, IssueSnapshot, Millis, Policy, PortError, PrRef, PrSnapshot, Repo, Result, Sha, SourceScope, Target } from '../domain/model.ts';
+import type {ExtensionContext} from '@oh-my-pi/pi-coding-agent';
+import type {Agenda,AgendaId,Caller,CheckAttempt,ClosureGate,CreatedIssueObservation,Facts,IssueRef,IssueSnapshot,Millis,PortError,PrRef,PrSnapshot,Repo,Result,Role,Sha,SourceScope,Target,Ticket} from '../domain/model.ts';
 
 export type PrWrite = {headRepo:Repo;branch:string;head:Sha;target:Target;title:string;body:string};
 export type IssueWrite = {repo:Repo;title:string;body:string};
@@ -25,19 +25,16 @@ export type StateError = {kind:'notFound'|'unsupportedFormat'|'corruptState'|'ve
 export interface AgendaFiles {
   load(id:AgendaId):Promise<Result<Agenda,StateError>>;
   list():Promise<Result<readonly Agenda[],StateError>>;
-  /** Exact-target retries repair durability; they never increment the supplied version. */
+  /** Exact-target retries repair durability without inventing a new version. */
   save(expectedVersion:number|null,state:Agenda):Promise<Result<null,StateError>>;
 }
 export type FileMetrics = {replaces:number;unchangedReplaces:number};
-export type WakeInput = {requestId:string;runId:string;agentId:string;parentId:string;messageId:string;body:string;startedAt:Millis};
-export type DeliveryReceipt = {agentId:string;messageId:string;outcome:'injected'|'woken'};
+export type SeatLaunch = {agendaId:string;ticketId:string;revision:number;role:Role;agent:string;cwd:string;sourceSessionFile:string|null;prompt:string;ticket:Ticket|ClosureGate;workspace:Target};
+export type SeatHandle = {agentId:string;sessionFile:string;jobId:string};
 export interface HostPort {
-  bind(ctx:ExtensionContext,runId:string):Result<Caller,PortError>;
-  release(ctx:ExtensionContext):void;
-  observe(runId:string,main:Caller):Result<HostObservation,PortError>;
-  validate(cwd:string,agents:readonly string[]):Promise<Result<HostObservation['preflight'] extends Result<infer T,PortError>?T:never,PortError>>;
-  wake(input:WakeInput):Promise<Result<DeliveryReceipt,PortError>>;
-  noteTurnEnd(agentId:string,runId:string,messageId:string):void;
-  dispose():void;
+  bind(ctx:ExtensionContext):Result<Caller,PortError>;
+  launch(input:SeatLaunch):Promise<Result<SeatHandle,PortError>>;
+  active(ticketId:string,role:Role):boolean;
+  finish(agendaId:string):Promise<Result<null,PortError>>;
+  dispose():Promise<void>;
 }
-export type PolicyReader = ()=>Promise<Result<Policy,PortError>>;
