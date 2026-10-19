@@ -105,6 +105,8 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
       const review=gateStamp(state,ticket,'review',facts),accept=gateStamp(state,ticket,'accept',facts);
       if(!pr||!review||!accept||ticket.gates.review&&canonical(ticket.gates.review.stamp)!==canonical(review)||ticket.gates.accept&&canonical(ticket.gates.accept.stamp)!==canonical(accept)){
         escalate(ticket,'PR head, target, closing link, body, or review contract changed; fresh gates are required.',at);
+      }else if(pr.checks.kind==='unknown'){
+        escalate(ticket,`Required CI observations cannot be verified: ${pr.checks.reason}`,at,'checks');
       }else if(pr.mergeable==='draft'){
         escalate(ticket,'The PR is a draft; Main must obtain a source change or adopt a ready PR.',at);
       }else if(pr.checks.kind==='failing'||pr.mergeable==='no'||pr.mergeable==='behind'){
@@ -134,7 +136,7 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
     if(effect.state.kind!=='ready')continue;
     const ticket=state.tickets.find(ticket=>ticket.id===effect.ticketId);
     if(effect.action.kind==='merge'&&ticket?.state!=='Merging'||effect.action.kind==='publishPr'&&ticket?.state!=='Publishing')effect.state={kind:'cancelled',reason:'Ticket no longer authorizes this effect'};
-    if(ticket&&effect.action.kind==='setIssueState'&&!effect.action.open&&ticket.state==='Coding')effect.state={kind:'cancelled',reason:'Main reopened coding and revoked the accepted closure'};
+    if(ticket&&effect.action.kind==='setIssueState'&&!effect.action.open&&!(ticket.state==='Escalated'&&ticket.terminal?.kind==='noCode'||ticket.state==='Verifying'&&ticket.gates.postMerge?.status==='passed'))effect.state={kind:'cancelled',reason:'Ticket no longer authorizes issue closure'};
   }
   const stamp=closureStamp(state,facts);
   if(state.parent){
@@ -297,7 +299,7 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
         const pr=sourcePr(ticket,facts);if(pr&&pr.state.kind==='open')ticket.pr={ref:pr.ref,headRepo:pr.headRepo,branch:pr.headBranch,head:pr.head,title:pr.title,body:pr.body};
       }
       ticket.state=operation.to;
-      if(operation.to==='Coding'&&ticket.terminal?.kind==='noCode')ticket.terminal=null;
+      if(operation.to!=='Done'&&ticket.terminal?.kind==='noCode')ticket.terminal=null;
       if(operation.to==='Done'){
         if(operation.noCode){
           ticket.terminal={kind:'noCode',bodyHash:source.bodyHash,reason:operation.noCode,at};

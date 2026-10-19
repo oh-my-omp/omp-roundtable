@@ -117,11 +117,11 @@ export class RoundtableController {
         if(live||operation.op==='finish'&&this.state.closure&&this.options.host.active(this.state.closure.id,'closure'))return domain('ownershipBlocked','Wait for retiring one-shot seat jobs to exit before finishing or removing their tickets');
       }
       const changed=applyOperation(this.state,operation,caller,fresh.value,Date.now());if(!changed.ok)return {ok:false,error:{kind:'domain',error:changed.error}};
-      const committed=await this.save(changed.value,this.state.version);if(!committed.ok)return committed;
       if(operation.op==='finish'){
         const cleaned=await this.options.host.finish(this.state.id);
         if(!cleaned.ok)return {ok:false,error:{kind:'host',error:cleaned.error}};
       }
+      const committed=await this.save(changed.value,this.state.version);if(!committed.ok)return committed;
       this.kick();
       // A seat's result exposes its own ticket, never the other tickets or effects.
       if(caller.kind==='seat'){
