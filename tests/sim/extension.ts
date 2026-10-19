@@ -27,7 +27,8 @@ const replySchema = z.object({ok: z.boolean(), value: z.object({
   ticket: z.object({state: z.string(), revision: z.number(), rulings: z.array(z.unknown())}).optional(),
 }).passthrough().optional()}).passthrough();
 type Reply = z.infer<typeof replySchema>;
-const briefTicketSchema = z.object({id: z.string(), revision: z.number(), notes: z.array(z.object({text: z.string()})).optional()}).passthrough();
+// Ticket notes are objects with `text`; closure notes are plain strings.
+const briefTicketSchema = z.object({id: z.string(), revision: z.number(), notes: z.array(z.unknown()).optional()}).passthrough();
 const intentSchema = z.object({required: z.array(z.string()).optional()}).passthrough();
 
 const text = (message: Message): string => typeof message.content === 'string' ? message.content
@@ -115,8 +116,9 @@ function mainStep(messages: Message[]): {step: Step; note: string} {
 
 /* ------------------------------------------------------------------ seats */
 
+/** The ticket the brief carries: its last paragraph is the ticket or closure JSON. */
 function ticketOf(brief: string): z.infer<typeof briefTicketSchema> {
-  return briefTicketSchema.parse(JSON.parse(brief.slice(brief.lastIndexOf('{"id":'))));
+  return briefTicketSchema.parse(JSON.parse(brief.slice(brief.lastIndexOf('\n\n') + 2)));
 }
 
 function inspect(expect: Expect, hold: string | null): string {
@@ -151,7 +153,7 @@ function ownerStep(messages: Message[], spec: TicketSpec, brief: string): {step:
   const revision = continued ? Number(continued[1]) : ticket.revision;
   // Handoffs before the latest prompt: a forked rework session inherits its predecessor's accepted handoffs.
   const handoffs = played(messages.slice(0, latest), 0, 'roundtable').filter(item => (item.op === 'submit' || item.op === 'escalate') && parseReply(item.result).ok).length;
-  const abandoned = continued ? 0 : (ticket.notes ?? []).filter(note => note.text.includes('ended without a handoff')).length;
+  const abandoned = continued ? 0 : (ticket.notes ?? []).filter(note => JSON.stringify(note).includes('ended without a handoff')).length;
   const round = handoffs + abandoned;
   const owner: OwnerRound = spec.owner[Math.min(round, spec.owner.length - 1)]!;
   const step = messages.slice(latest + 1).filter(message => message.role === 'assistant').length;

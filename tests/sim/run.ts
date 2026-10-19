@@ -137,6 +137,27 @@ function seatSessions(run: Run, agendaId: string): SeatSession[] {
   });
 }
 
+const callSchema = z.object({type: z.literal('toolCall'), id: z.string(), name: z.string(), arguments: z.object({input: z.object({op: z.string(), note: z.string().optional()}).passthrough()}).passthrough()}).passthrough();
+const messageLineSchema = z.object({message: z.object({role: z.string(), content: z.unknown(), toolCallId: z.string().optional()}).passthrough()}).passthrough();
+
+/** Verdicts a gate seat actually submitted and the roundtable accepted, read from the seat transcripts. */
+function acceptedVerdicts(sessions: SeatSession[]): {ticket: string; role: string; note: string}[] {
+  const out: {ticket: string; role: string; note: string}[] = [];
+  for (const session of sessions) {
+    const messages = session.lines.flatMap(line => { const parsed = messageLineSchema.safeParse(line); return parsed.success ? [parsed.data.message] : []; });
+    for (const message of messages) {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+      for (const block of message.content) {
+        const call = callSchema.safeParse(block);
+        if (!call.success || call.data.name !== 'roundtable' || call.data.arguments.input.op !== 'verdict') continue;
+        const result = messages.find(item => item.role === 'toolResult' && item.toolCallId === call.data.id);
+        if (result && JSON.stringify(result.content).includes('\\"ok\\":true')) out.push({ticket: session.ticket, role: session.role, note: call.data.arguments.input.note ?? ''});
+      }
+    }
+  }
+  return out;
+}
+
 const simState = (run: Run): SimState => withState(run.github, state => structuredClone(state));
 const gitIn = (run: Run, args: string[]) => git(remotePath(run.github, KEY), args, true);
 
@@ -173,19 +194,24 @@ async function commonChecks(run: Run, expectOnMain: Expect): Promise<string[]> {
   }
   // Gates judged the exact commit: review/accept sat on PR commits, postMerge on the merge commit.
   const sim = simState(run);
-  for (const entry of log) {
-    const input = roundtableInput(entry);
-    if (entry.kind !== 'seat' || input?.op !== 'verdict' || !input.note || !entry.ticket) continue;
-    const head = /HEAD ([0-9a-f]{40})/.exec(input.note)?.[1];
-    if (!head) { failures.push(`${entry.ticket} ${entry.role} verdict has no observed HEAD`); continue; }
-    if (entry.role === 'closure') continue;
-    const spec = run.scenario.tickets.find(ticket => ticket.id === entry.ticket);
+  const verdicts = acceptedVerdicts(seatSessions(run, state?.id ?? ''));
+  for (const ticket of run.scenario.tickets.filter(item => Object.keys(item.gate).length > 0))
+    for (const role of ['review', 'accept', 'postMerge']) if (!verdicts.some(verdict => verdict.ticket === ticket.id && verdict.role === role)) failures.push(`${ticket.id} has no accepted ${role} verdict in its transcripts`);
+  if (run.scenario.parent !== null && !verdicts.some(verdict => verdict.role === 'closure')) failures.push('no accepted closure verdict in the transcripts');
+  for (const verdict of verdicts) {
+    const head = /HEAD ([0-9a-f]{40})/.exec(verdict.note)?.[1];
+    if (!head) { failures.push(`${verdict.ticket} ${verdict.role} verdict has no observed HEAD`); continue; }
+    if (verdict.role === 'closure') {
+      if (gitIn(run, ['merge-base', '--is-ancestor', head, 'main']).code !== 0) failures.push(`closure sat on ${head}, which is not on main`);
+      continue;
+    }
+    const spec = run.scenario.tickets.find(ticket => ticket.id === verdict.ticket);
     const pr = sim.prs.find(item => item.state === 'MERGED' && spec && item.body.includes(`#${spec.issue}`));
-    if (!pr?.mergeCommit) { failures.push(`${entry.ticket} has no merged PR`); continue; }
-    if (entry.role === 'postMerge') {
-      if (head !== pr.mergeCommit) failures.push(`${entry.ticket} postMerge sat on ${head}, not merge ${pr.mergeCommit}`);
+    if (!pr?.mergeCommit) { failures.push(`${verdict.ticket} has no merged PR`); continue; }
+    if (verdict.role === 'postMerge') {
+      if (head !== pr.mergeCommit) failures.push(`${verdict.ticket} postMerge sat on ${head}, not merge ${pr.mergeCommit}`);
     } else if (gitIn(run, ['merge-base', '--is-ancestor', head, pr.lastHead]).code !== 0 || gitIn(run, ['merge-base', '--is-ancestor', head, `${pr.mergeCommit}^1`]).code === 0) {
-      failures.push(`${entry.ticket} ${entry.role} sat on ${head}, which is not a commit of its PR`);
+      failures.push(`${verdict.ticket} ${verdict.role} sat on ${head}, which is not a commit of its PR`);
     }
   }
   for (const issue of sim.issues) if (issue.state !== 'CLOSED') failures.push(`issue #${issue.number} is still open`);
@@ -306,9 +332,10 @@ const cases: Case[] = [
       const state = await agenda(run);
       const notes = ticketOf(state, 'H')?.notes ?? [];
       if (notes.some(note => note.kind === 'escalation' || note.text.includes('changed after approval'))) failures.push(`H escalated on a legitimate PR update: ${JSON.stringify(notes)}`);
-      const verdicts = modelLog(run).map(roundtableInput).filter(input => input?.op === 'verdict' && input.ticketId === 'H');
-      if (verdicts.some(input => input?.note?.includes('h.txt="1\\n"'))) failures.push('a gate on the superseded head submitted a verdict');
-      const reviews = seatSessions(run, state!.id).filter(session => session.ticket === 'H' && session.role === 'review');
+      const sessions = seatSessions(run, state!.id);
+      // The superseded gates are aborted at their next tool boundary, so no verdict on the first head may be accepted.
+      if (acceptedVerdicts(sessions).some(verdict => verdict.ticket === 'H' && verdict.note.includes('h.txt="1\\n"'))) failures.push('a gate on the superseded head had its verdict accepted');
+      const reviews = sessions.filter(session => session.ticket === 'H' && session.role === 'review');
       if (reviews.length < 2) failures.push(`expected a fresh review seat for the new head, found ${reviews.length}`);
       return failures;
     },
