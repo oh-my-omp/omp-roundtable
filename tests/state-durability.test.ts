@@ -8,7 +8,7 @@ import {z} from '@oh-my-pi/omptype/zod';
 
 function agenda():Agenda {
   return {id:'aaaabbbb-1111-4111-8111-111111111111',version:1,nextId:1,convenedAt:1,lifecycle:'active',parent:null,closure:null,effects:[],run:{kind:'detached'},summary:null,tickets:[{
-    id:'one',revision:1,issue:{repo:{owner:'test',name:'repo'},number:1},target:{repo:{owner:'test',name:'repo'},base:'main'},dependsOn:[],contract:{revision:1,bodyHash:'0'.repeat(64),body:''},state:'Coding',ownerSessionFile:null,pr:null,gates:{review:null,accept:null,postMerge:null},rulings:[],notes:[],terminal:null,
+    id:'one',revision:1,issue:{repo:{owner:'test',name:'repo'},number:1},target:{repo:{owner:'test',name:'repo'},base:'main'},dependsOn:[],contract:{revision:1,bodyHash:'0'.repeat(64),body:''},state:'Coding',ownerSessionFile:null,started:false,pr:null,gates:{review:null,accept:null,postMerge:null},rulings:[],notes:[],terminal:null,
   }]};
 }
 
@@ -27,8 +27,8 @@ describe('durable ticket agenda files',()=>{
       expect(await files.save(1,advanced)).toEqual({ok:true,value:null});
       const path=join(root,'state',`${state.id}.json`);
       const encoded:unknown=JSON.parse(await readFile(path,'utf8'));
-      expect(encoded).toMatchObject({format:4,state:{version:2}});
-      await writeFile(path,JSON.stringify({format:3,state}));
+      expect(encoded).toMatchObject({format:5,state:{version:2}});
+      await writeFile(path,JSON.stringify({format:4,state}));
       expect(await files.load(state.id)).toMatchObject({ok:false,error:{kind:'unsupportedFormat'}});
     }finally {await rm(root,{recursive:true,force:true});}
   });

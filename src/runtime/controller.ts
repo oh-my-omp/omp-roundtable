@@ -1,15 +1,16 @@
 import {randomUUID} from 'node:crypto';
-import type {Agenda,Caller,DomainError,Effect,EffectResult,Facts,PortError,PortInput,Result,Role} from '../domain/model.ts';
-import {applyOperation,availableRoles,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
+import {SEAT_ROLES,type Agenda,type Caller,type DomainError,type Effect,type EffectResult,type Facts,type PortError,type PortInput,type Result,type Role} from '../domain/model.ts';
+import {abandonSeat,applyOperation,availableRoles,awaitsLaunch,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
 import {canonical,sameRef} from '../domain/identity.ts';
 import {seatBrief} from '../domain/briefs.ts';
-import type {AgendaFiles,GitHubPort,HostPort,StateError} from '../ports/contracts.ts';
+import type {AgendaFiles,GitHubPort,HostPort,SeatExit,SeatHandle,SeatLaunch,SeatWorkspace,StateError} from '../ports/contracts.ts';
 import {createSourceReader,type SourceReceipt} from './source.ts';
 
 export type RuntimeError={kind:'domain';error:DomainError}|{kind:'storage';error:StateError}|{kind:'source'|'host';error:PortError};
-export type AgendaView={agenda:Agenda;available:{ticketId:string;revision:number;roles:Role[]}[]};
-export type ControllerOutput=AgendaView|{active:string[]}|{ticket:Agenda['tickets'][number]|NonNullable<Agenda['closure']>}|{launched:{agentId:string;sessionFile:string;jobId:string}};
-export type ControllerOptions={files:AgendaFiles;github:GitHubPort;host:HostPort;ownerAgent:string;gateAgent:string;intervalSeconds:number;onChange:()=>void;onError:(error:RuntimeError)=>void};
+/** Main's view: which tickets it may put on the table, and which seats the relay currently runs. */
+export type AgendaView={agenda:Agenda;launchable:string[];seated:{ticketId:string;roles:Role[]}[]};
+export type ControllerOutput=AgendaView|{active:string[]}|{ticket:Agenda['tickets'][number]|NonNullable<Agenda['closure']>}|{launched:SeatHandle[]};
+export type ControllerOptions={files:AgendaFiles;github:GitHubPort;host:HostPort;cwd:string;ownerAgent:string;gateAgent:string;intervalSeconds:number;onChange:()=>void;onError:(error:RuntimeError)=>void};
 function domain(kind:DomainError['kind'],message:string):{ok:false;error:RuntimeError}{return {ok:false,error:{kind:'domain',error:{kind,message}}};}
 
 /** The controller is the sole writer of its agenda. GitHub observations are never optimistic writes. */
@@ -56,17 +57,17 @@ export class RoundtableController {
   }
   private view():Result<ControllerOutput,RuntimeError> {
     if(!this.state)return domain('notFound','No agenda is attached');
-    return {ok:true,value:{agenda:structuredClone(this.state),available:[
-      ...this.state.tickets.map(ticket=>({ticketId:ticket.id,revision:ticket.revision,roles:availableRoles(this.state!,ticket).filter(role=>!this.options.host.active(ticket.id,role))})),
-      ...(this.state.closure?[{ticketId:this.state.closure.id,revision:this.state.closure.revision,roles:this.state.closure.state==='Reviewing'&&this.state.closure.gate.status==='pending'&&!this.options.host.active(this.state.closure.id,'closure')?['closure' as const]:[]}]:[]),
-    ]}};
+    const state=this.state,host=this.options.host;
+    const seated=[...state.tickets.map(ticket=>ticket.id),...(state.closure?[state.closure.id]:[])]
+      .map(ticketId=>({ticketId,roles:SEAT_ROLES.filter(role=>host.active(ticketId,role))})).filter(item=>item.roles.length>0);
+    return {ok:true,value:{agenda:structuredClone(state),launchable:state.tickets.filter(ticket=>awaitsLaunch(state,ticket)).map(ticket=>ticket.id),seated}};
   }
   async startup(caller:Caller):Promise<Result<ControllerOutput,RuntimeError>> {
     if(caller.kind!=='main'||!this.visible(caller))return domain('unauthorized','Only the native coordinator may inspect saved agendas');
     const list=await this.options.files.list();if(!list.ok)return {ok:false,error:{kind:'storage',error:list.error}};
     return {ok:true,value:{active:list.value.filter(state=>state.lifecycle==='active').map(state=>state.id)}};
   }
-  async execute(caller:Caller,operation:PortInput,cwd:string):Promise<Result<ControllerOutput,RuntimeError>> {
+  async execute(caller:Caller,operation:PortInput):Promise<Result<ControllerOutput,RuntimeError>> {
     return this.serial(async()=>{
       const flushed=await this.flush();if(!flushed.ok)return flushed;
       if(!this.visible(caller))return domain('unauthorized','Caller is not a native session of this coordinator');
@@ -103,22 +104,9 @@ export class RoundtableController {
       }
       const fresh=await this.source.read(this.state,operation,operation.op);if(!fresh.ok)return {ok:false,error:{kind:'source',error:fresh.error}};
       const settled=await this.settle(fresh.value);if(!settled.ok)return settled;
-      if(operation.op==='launch'){
-        if(caller.kind!=='main')return domain('unauthorized','Only Main chooses which seat to launch');
-        const ticket=this.state.tickets.find(ticket=>ticket.id===operation.ticketId),closure=this.state.closure?.id===operation.ticketId?this.state.closure:null;
-        const revision=ticket?.revision??closure?.revision;
-        const allowed=ticket?availableRoles(this.state,ticket).includes(operation.role):closure?.state==='Reviewing'&&closure.gate.status==='pending'&&operation.role==='closure';
-        if(!allowed||!revision)return domain('invalidTransition','This ticket role is not actionable');
-        if(this.options.host.active(operation.ticketId,operation.role))return domain('ownershipBlocked','This ticket role already has a live seat');
-        const launched=await this.options.host.launch({agendaId:this.state.id,ticketId:operation.ticketId,revision,role:operation.role,agent:operation.role==='owner'?this.options.ownerAgent:this.options.gateAgent,cwd,
-          sourceSessionFile:operation.role==='owner'?ticket?.ownerSessionFile??null:null,prompt:seatBrief(this.state,operation.ticketId,operation.role),
-          ticket:ticket??closure!,workspace:ticket?.target??this.state.tickets[0]!.target});
-        if(!launched.ok)return {ok:false,error:{kind:'host',error:launched.error}};
-        return {ok:true,value:{launched:launched.value}};
-      }
       if(operation.op==='finish'||operation.op==='resolve'&&operation.remove?.length){
         const retiring=operation.op==='finish'?this.state.tickets:this.state.tickets.filter(ticket=>operation.remove?.includes(ticket.id));
-        const live=retiring.some(ticket=>(['owner','review','accept','postMerge'] as const).some(role=>this.options.host.active(ticket.id,role)));
+        const live=retiring.some(ticket=>SEAT_ROLES.some(role=>this.options.host.active(ticket.id,role)));
         if(live||operation.op==='finish'&&this.state.closure&&this.options.host.active(this.state.closure.id,'closure'))return domain('ownershipBlocked','Wait for retiring one-shot seat jobs to exit before finishing or removing their tickets');
       }
       const changed=applyOperation(this.state,operation,caller,fresh.value,Date.now());if(!changed.ok)return {ok:false,error:{kind:'domain',error:changed.error}};
@@ -127,6 +115,11 @@ export class RoundtableController {
         if(!cleaned.ok)return {ok:false,error:{kind:'host',error:cleaned.error}};
       }
       const committed=await this.save(changed.value,this.state.version);if(!committed.ok)return committed;
+      if(operation.op==='launch'){
+        // Putting a ticket on the table seats its current stage at once; later stages follow from the relay.
+        const relayed=await this.relay();if(!relayed.ok)return relayed;
+        this.kick();return {ok:true,value:{launched:relayed.value}};
+      }
       this.kick();
       // A seat's result exposes its own ticket, never the other tickets or effects.
       if(caller.kind==='seat'){
@@ -148,6 +141,72 @@ export class RoundtableController {
     this.scheduled=setTimeout(()=>{this.scheduled=null;void this.run().catch(error=>this.unexpected(error));},0);this.scheduled.unref();
   }
   private unexpected(error:unknown):void {this.options.onError({kind:'host',error:{kind:'unavailable',message:error instanceof Error?error.message:String(error)}});}
+  /**
+   * A seat's exit wakes the relay. An exit without a handoff at a still-current revision escalates the ticket,
+   * so a seat that keeps failing reaches Main instead of being relaunched forever.
+   */
+  seatExited(seat:SeatExit,handedOff:boolean,error:string|null):void {
+    if(this.closed)return;
+    if(!handedOff)void this.serial(async()=>{
+      const flushed=await this.flush();if(!flushed.ok){this.options.onError(flushed.error);return;}
+      if(this.closed||this.state?.lifecycle!=='active')return;
+      const next=structuredClone(this.state);
+      if(!abandonSeat(next,seat.ticketId,seat.role,seat.revision,error??'the session ended without submit, verdict, or escalate',Date.now()))return;
+      next.version++;const saved=await this.save(next,this.state.version);if(!saved.ok)this.options.onError(saved.error);
+    }).catch(error=>this.unexpected(error));
+    this.kick();
+  }
+  /** The launch input of a due seat, or null when the agenda no longer offers that role. */
+  private seatLaunch(ticketId:string,role:Role):SeatLaunch|null {
+    const state=this.state;if(!state)return null;
+    const ticket=state.tickets.find(ticket=>ticket.id===ticketId),closure=state.closure?.id===ticketId?state.closure:null;
+    let workspace:SeatWorkspace,revision:number;
+    if(ticket){
+      if(!availableRoles(state,ticket).includes(role))return null;
+      revision=ticket.revision;
+      const stamp=role==='owner'||role==='closure'?null:ticket.gates[role]?.stamp;
+      // Gates judge exactly the PR head or merge commit their stamp names, never the target branch.
+      if(role==='owner')workspace=ticket.ownerSessionFile?{kind:'fork',sessionFile:ticket.ownerSessionFile}:{kind:'base',target:ticket.target};
+      else if((stamp?.kind==='review'||stamp?.kind==='accept')&&stamp.kind===role)workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.head,pull:stamp.pr.number};
+      else if(stamp?.kind==='postMerge'&&role==='postMerge')workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.commit,pull:null};
+      else return null;
+    }else if(closure&&role==='closure'&&closure.state==='Reviewing'&&closure.gate.status==='pending'){
+      revision=closure.revision;workspace={kind:'base',target:state.tickets[0]!.target};
+    }else return null;
+    return {agendaId:state.id,ticketId,revision,role,agent:role==='owner'?this.options.ownerAgent:this.options.gateAgent,cwd:this.options.cwd,
+      prompt:seatBrief(state,ticketId,role),ticket:ticket??closure!,workspace};
+  }
+  /**
+   * Seats follow from ticket state alone: every started ticket and the parent closure receive their due seats
+   * without Main. A seat waits for any live seat of its own role (a superseded revision ends at its next tool
+   * boundary); an Owner waits for every seat of its ticket, so a rework fork copies a complete, flushed transcript
+   * and owns the checkout alone.
+   */
+  private async relay():Promise<Result<SeatHandle[],RuntimeError>> {
+    const launched:SeatHandle[]=[],host=this.options.host;
+    if(this.closed||this.state?.lifecycle!=='active')return {ok:true,value:launched};
+    const due:{ticketId:string;role:Role}[]=[];
+    for(const ticket of this.state.tickets){
+      if(!ticket.started)continue;
+      for(const role of availableRoles(this.state,ticket))
+        if(role==='owner'?!SEAT_ROLES.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
+    }
+    const closure=this.state.closure;
+    if(closure?.state==='Reviewing'&&closure.gate.status==='pending'&&!host.active(closure.id,'closure'))due.push({ticketId:closure.id,role:'closure'});
+    for(const {ticketId,role} of due){
+      // An earlier failed launch may have escalated this ticket.
+      const input=this.seatLaunch(ticketId,role);if(!input)continue;
+      const result=await host.launch(input);
+      if(result.ok){launched.push(result.value);continue;}
+      this.options.onError({kind:'host',error:result.error});
+      // A precondition refusal (a seat already live, a host shutting down) is a race, not a broken seat.
+      if(result.error.kind==='precondition')continue;
+      const next=structuredClone(this.state);
+      if(!abandonSeat(next,ticketId,role,input.revision,`launch failed: ${result.error.message}`,Date.now()))continue;
+      next.version++;const saved=await this.save(next,this.state.version);if(!saved.ok)return saved;
+    }
+    return {ok:true,value:launched};
+  }
   /** Exposed for deterministic integration driving; the production timer uses the same entry. */
   async run():Promise<void> {
     await this.serial(async()=>{
@@ -155,6 +214,7 @@ export class RoundtableController {
       if(this.closed||!this.state||this.state.lifecycle!=='active')return;
       const observed=await this.source.read(this.state,null,'refresh');if(!observed.ok){this.options.onError({kind:'source',error:observed.error});return;}
       const settled=await this.settle(observed.value);if(!settled.ok){this.options.onError(settled.error);return;}
+      const seated=await this.relay();if(!seated.ok){this.options.onError(seated.error);return;}
       const runnable=(effect:Effect):boolean=>{
         if(effect.state.kind!=='ready')return false;
         if(effect.action.kind!=='merge')return true;
@@ -165,6 +225,8 @@ export class RoundtableController {
       const effect=this.state.effects.find(effect=>effect.state.kind==='executing')??this.state.effects.find(effect=>effect.state.kind==='uncertain'&&satisfiedResult(this.state!,effect,observed.value))??this.state.effects.find(runnable);
       if(!effect)return;
       const result=await this.drive(effect,observed.value);if(!result.ok){this.options.onError(result.error);return;}
+      // A confirmed effect advances the ticket (Reviewing after publish, Verifying after merge); seat its next stage.
+      const advanced=await this.relay();if(!advanced.ok){this.options.onError(advanced.error);return;}
       if(this.state.effects.some(effect=>runnable(effect)||effect.state.kind==='executing'))this.kick();
     });
   }

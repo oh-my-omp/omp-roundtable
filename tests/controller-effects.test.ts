@@ -37,16 +37,16 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     createPr:operation==='publishPr'?unknownWrite:unexpected,mergePr:operation==='merge'?unknownWrite:unexpected,
   };
   const errors:unknown[]=[];
-  controller=new RoundtableController({files,github,host,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
+  controller=new RoundtableController({files,github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
   const main:Caller={kind:'main',agentId:'Main',sessionId:'first-main',sessionFile:null};controller.setMain(main);
   try {
-    const convened=await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:operation==='merge'?prRef:null}]},root);
+    const convened=await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:operation==='merge'?prRef:null}]});
     expect(convened.ok).toBe(true);
     const owner:Caller={kind:'seat',agentId:'Owner',sessionId:'first-owner',sessionFile:join(root,'owner.jsonl'),ticketId:'one',revision:1,role:'owner'};
-    if(operation==='publishPr')expect((await controller.execute(owner,{op:'submit',ticketId:'one',revision:1,branch:'feature',head,title:'Deliver one',body:'Closes test/roundtable#1'},root)).ok).toBe(true);
+    if(operation==='publishPr')expect((await controller.execute(owner,{op:'submit',ticketId:'one',revision:1,branch:'feature',head,title:'Deliver one',body:'Closes test/roundtable#1'})).ok).toBe(true);
     else for(const role of ['review','accept'] as const){
       const gate:Caller={kind:'seat',agentId:role,sessionId:role,sessionFile:join(root,`${role}.jsonl`),ticketId:'one',revision:1,role};
-      expect((await controller.execute(gate,{op:'verdict',ticketId:'one',revision:1,role,ok:true,note:'Verified the exact contract and head.'},root)).ok).toBe(true);
+      expect((await controller.execute(gate,{op:'verdict',ticketId:'one',revision:1,role,ok:true,note:'Verified the exact contract and head.'})).ok).toBe(true);
     }
     if(operation==='merge'){
       source.prs[0]!.mergeable='unknown';
@@ -64,9 +64,9 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     expect(failed.tickets[0]?.state).toBe('Escalated');
     if(operation==='publishPr')expect(failed.tickets[0]?.ownerSessionFile).toBe(owner.sessionFile);
     await controller.shutdown();
-    controller=new RoundtableController({files,github,host,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
+    controller=new RoundtableController({files,github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
     const successor:Caller={kind:'main',agentId:'Main',sessionId:'second-main',sessionFile:null};controller.setMain(successor);
-    expect((await controller.execute(successor,{op:'resume',agenda:failed.id,operatorConfirmedOriginalSessionEnded:true},root)).ok).toBe(true);
+    expect((await controller.execute(successor,{op:'resume',agenda:failed.id,operatorConfirmedOriginalSessionEnded:true})).ok).toBe(true);
     await controller.run();await controller.run();
     expect(calls).toBe(1);
     expect(controller.snapshot()?.effects[0]?.state.kind).toBe('uncertain');
@@ -86,11 +86,11 @@ test('Main can adopt a source-confirmed external merge below the target head in 
     contains:async(_repo,ancestor,descendant)=>{comparisons.push(`${ancestor}:${descendant}`);return success('contains');},
     openPrsByHead:async()=>success([]),branchHead:unexpected,issue:unexpected,pr:unexpected,issuesCreatedSince:unexpected,checkAttempt:unexpected,createIssue:unexpected,addSubIssue:unexpected,editIssueBody:unexpected,setIssueOpen:unexpected,editPr:unexpected,rerunCheck:unexpected,createPr:unexpected,mergePr:unexpected,
   };
-  const controller=new RoundtableController({files:createAgendaFiles(root),github,host,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:unexpected});
+  const controller=new RoundtableController({files:createAgendaFiles(root),github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:unexpected});
   const main:Caller={kind:'main',agentId:'Main',sessionId:'external-main',sessionFile:null};controller.setMain(main);
   try {
-    expect((await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]},root)).ok).toBe(true);
-    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:1,ruling:'The author merged this change externally; the current target contains its merge.',to:'Done',adoptPr:prRef},root);
+    expect((await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]})).ok).toBe(true);
+    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:1,ruling:'The author merged this change externally; the current target contains its merge.',to:'Done',adoptPr:prRef});
     expect(adopted.ok).toBe(true);
     expect(comparisons).toContain(`${merge}:${base}`);
     expect(controller.snapshot()?.tickets[0]).toMatchObject({state:'Done',terminal:{kind:'merged',mergeSha:merge}});

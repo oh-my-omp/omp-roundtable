@@ -5,8 +5,7 @@ import {AgentRegistry,MAIN_AGENT_ID} from '@oh-my-pi/pi-coding-agent/registry/ag
 import {launcherCommand} from './src/launcher/commands.ts';
 import {buildPublicGrammar} from './src/domain/public-grammar.ts';
 import {parseToolParameters} from './src/domain/parse.ts';
-import {canonical} from './src/domain/identity.ts';
-import {availableRoles} from './src/domain/engine.ts';
+import {Attention} from './src/runtime/attention.ts';
 import {createAgendaFiles} from './src/ports/state.ts';
 import {createGitHubPort} from './src/ports/github.ts';
 import {createHostPort} from './src/ports/host.ts';
@@ -29,8 +28,9 @@ class ProcessRuntime {
   private binding:{pi:ExtensionAPI;ctx:ExtensionContext}|null=null;
   private controller:RoundtableController|null=null;
   private host:HostPort|null=null;
-  private notified:string|null=null;
+  private readonly attention=new Attention();
   private started=false;
+  private deferred=false;
   readIdentity(pi:ExtensionAPI):Identity {
     if(this.identity)return this.identity;
     const flag=pi.getFlag('roundtable');
@@ -42,15 +42,22 @@ class ProcessRuntime {
     logger.error('Roundtable runtime error',{error:JSON.stringify(error)});
     this.binding?.ctx.ui.notify(`Roundtable: ${JSON.stringify(error)}`,'error');
   }
-  private changed():void {
-    const agenda=this.controller?.snapshot(),binding=this.binding;
-    if(!agenda||!binding)return;
-    const available=agenda.tickets.map(ticket=>({id:ticket.id,revision:ticket.revision,state:ticket.state,roles:availableRoles(agenda,ticket).filter(role=>!this.host?.active(ticket.id,role))}));
-    const signature=canonical({tickets:available,closure:agenda.closure?.state,closureRevision:agenda.closure?.revision,lifecycle:agenda.lifecycle});
-    if(signature===this.notified)return;
-    this.notified=signature;
-    if(agenda.lifecycle==='completed')return;
-    binding.pi.sendMessage({customType:'roundtable-attention',display:true,content:'Roundtable ticket availability or escalation changed. Call roundtable status for the current source-confirmed tickets, launch ready seats according to your topology, and resolve Escalated tickets. This notification is not a ticket snapshot.'},{triggerTurn:true,deliverAs:'nextTurn'});
+  /**
+   * Main wakes only for a decision still open when its turn ends: a launchable ticket, an Escalated ticket or
+   * closure, or a finished agenda. While Main is busy it sees the agenda through its own calls, so a decision it
+   * settles within the same turn (launching what convene unlocked, resolving an escalation) never wakes it again.
+   */
+  private changed(turnEnded=false):void {
+    const agenda=this.controller?.snapshot(),binding=this.binding,host=this.host;
+    if(!agenda||!binding||!host)return;
+    if(!turnEnded&&!binding.ctx.isIdle()){this.deferred=true;return;}
+    this.deferred=false;
+    const fresh=this.attention.observe(agenda,(ticketId,role)=>host.active(ticketId,role));
+    if(!fresh.length)return;
+    binding.pi.sendMessage({customType:'roundtable-attention',display:true,content:`Roundtable needs Main: ${fresh.join(', ')}. launch:<ticket> may be put on the table; escalated:<ticket>:<revision> awaits read and resolve; finish means every ticket and the closure are Done. Call roundtable status for the source-confirmed agenda; this notification is not a ticket snapshot.`},{triggerTurn:true,deliverAs:'nextTurn'});
+  }
+  mainTurnEnded(ctx:ExtensionContext):void {
+    if(this.deferred&&this.binding?.ctx.sessionManager===ctx.sessionManager)this.changed(true);
   }
   async start(pi:ExtensionAPI,ctx:ExtensionContext,identity:CoordinatorIdentity):Promise<void> {
     if(this.started)return;
@@ -58,18 +65,20 @@ class ProcessRuntime {
     if(ctx.agent.id!==MAIN_AGENT_ID||ctx.agent.kind!=='main'||!root||root.sessionManager!==ctx.sessionManager)throw new Error('Roundtable requires the actual native Main');
     this.started=true;this.binding={pi,ctx};
     const directory=resolve(ctx.cwd,this.directory.get(root.settings));
-    this.host=createHostPort({sessionDir:join(directory,'sessions'),
+    this.host=createHostPort({dataDir:directory,
       ticketRevision:ticketId=>this.controller?.ticketRevision(ticketId)??null,
-      execute:async(caller,input,cwd)=>{
+      execute:async(caller,input)=>{
         if(!this.controller)return {ok:false,error:{kind:'domain',error:{kind:'ownershipBlocked',message:'Coordinator has not started'}}};
-        return this.controller.execute(caller,input,cwd);
+        return this.controller.execute(caller,input);
       },
-      onExit:(ticketId,handedOff,error)=>{
-        if(error||!handedOff)pi.sendMessage({customType:'roundtable-seat-exit',display:true,content:`Ticket ${ticketId} seat exited ${handedOff?'after handoff':'without a handoff'}${error?`: ${error}`:''}. Inspect roundtable status before deciding the next action.`},{triggerTurn:true,deliverAs:'nextTurn'});
+      onExit:(seat,handedOff,error)=>{
+        if(handedOff&&error)this.report({kind:'host',error:{kind:'unavailable',message:`Ticket ${seat.ticketId} ${seat.role} seat cleanup: ${error}`}});
+        this.controller?.seatExited(seat,handedOff,error);
         this.changed();
       },
+      onSeatError:(ticketId,message)=>this.report({kind:'host',error:{kind:'unavailable',message:`Ticket ${ticketId} seat: ${message}`}}),
     });
-    this.controller=new RoundtableController({files:createAgendaFiles(directory),github:createGitHubPort(),host:this.host,ownerAgent:this.owner.get(root.settings),gateAgent:this.gate.get(root.settings),intervalSeconds:this.interval.get(root.settings),onChange:()=>this.changed(),onError:error=>this.report(error)});
+    this.controller=new RoundtableController({files:createAgendaFiles(directory),github:createGitHubPort(),host:this.host,cwd:ctx.cwd,ownerAgent:this.owner.get(root.settings),gateAgent:this.gate.get(root.settings),intervalSeconds:this.interval.get(root.settings),onChange:()=>this.changed(),onError:error=>this.report(error)});
     const caller=this.host.bind(ctx);if(!caller.ok||caller.value.kind!=='main')throw new Error('Cannot bind Main to the coordinator');
     this.controller.setMain(caller.value);
     await pi.setActiveTools([...new Set([...pi.getActiveTools(),'roundtable'])]);
@@ -84,7 +93,7 @@ class ProcessRuntime {
     if(!this.host||!this.controller)return {ok:false,error:{kind:'inactive',message:'This process is not a Roundtable coordinator'}};
     const caller=this.host.bind(ctx);
     if(!caller.ok)return {ok:false,error:{kind:'host',error:caller.error}};
-    const result=await this.controller.execute(caller.value,parsed.value.input,ctx.cwd);
+    const result=await this.controller.execute(caller.value,parsed.value.input);
     this.changed();return result;
   }
   async shutdown(ctx:ExtensionContext):Promise<void> {
@@ -96,7 +105,7 @@ const slots=globalThis as typeof globalThis&{[SLOT]?:ProcessRuntime};
 export default function roundtable(pi:ExtensionAPI):void {
   const runtime=slots[SLOT]??(slots[SLOT]=new ProcessRuntime());
   pi.registerFlag('roundtable',{description:'Start Main as coordinator for <owner>/<repo>#<number>',type:'string'});
-  pi.registerTool({name:'roundtable',label:'Roundtable',description:'Main coordinates a durable ticket graph; launch chooses one one-shot seat. Seats read one ticket and hand off with submit/verdict/escalate. GitHub writes are performed and freshly confirmed by the state machine.',parameters:buildPublicGrammar(z).toolParametersSchema,defaultInactive:true,
+  pi.registerTool({name:'roundtable',label:'Roundtable',description:'Main coordinates a durable ticket graph and launches each ticket once; the roundtable then relays its seats until Done or Escalated. Seats read one ticket and hand off with submit/verdict/escalate. GitHub writes are performed and freshly confirmed by the state machine.',parameters:buildPublicGrammar(z).toolParametersSchema,defaultInactive:true,
     async execute(_id,params,_signal,_update,ctx){const response=await runtime.execute(ctx,params);return {content:[{type:'text',text:JSON.stringify(response)}],details:response,isError:!response.ok};},
   });
   pi.registerCommand('roundtable-launcher',{description:'Install, uninstall, or inspect the local Roundtable link launcher (install|uninstall|status)',async handler(args,ctx){const result=await launcherCommand(args.trim().split(/\s+/).filter(part=>part.length>0));ctx.ui.notify(result.ok?result.value:result.error,result.ok?'info':'error');}});
@@ -106,5 +115,6 @@ export default function roundtable(pi:ExtensionAPI):void {
     if(identity.kind==='invalid'){ctx.ui.notify(identity.message,'error');return;}
     if(ctx.agent.id===MAIN_AGENT_ID&&ctx.agent.kind==='main')await runtime.start(pi,ctx,identity);
   });
+  pi.on('agent_end',(_event,ctx)=>runtime.mainTurnEnded(ctx));
   pi.on('session_shutdown',async(_event,ctx)=>runtime.shutdown(ctx));
 }

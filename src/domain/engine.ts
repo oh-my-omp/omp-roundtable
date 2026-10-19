@@ -17,7 +17,7 @@ function ticketFrom(entry:Entry,facts:Facts):Result<Ticket,DomainError> {
   if(!source)return reject('sourceUnavailable',`Issue ${entry.id} was not returned by GitHub`);
   if(!targetHead(facts,entry.target))return reject('sourceUnavailable',`Target for ${entry.id} does not exist`);
   const ticket:Ticket={id:entry.id,revision:1,issue:entry.issue,target:entry.target,dependsOn:entry.dependsOn,
-    contract:{revision:1,bodyHash:source.bodyHash,body:source.body},state:'Coding',ownerSessionFile:null,pr:null,
+    contract:{revision:1,bodyHash:source.bodyHash,body:source.body},state:'Coding',ownerSessionFile:null,started:false,pr:null,
     gates:{review:null,accept:null,postMerge:null},rulings:[],notes:[],terminal:null};
   if(entry.adoptPr){
     const pr=facts.prs.find(pr=>sameRef(pr.ref,entry.adoptPr!));
@@ -49,6 +49,10 @@ export function availableRoles(state:Agenda,ticket:Ticket):Role[] {
     case 'Verifying':return ticket.gates.postMerge?.status==='pending'?['postMerge']:[];
     case 'Publishing':case 'Merging':case 'Escalated':case 'Done':return [];
   }
+}
+/** A Coding ticket Main has not put on the table yet, whose dependencies are all Done. */
+export function awaitsLaunch(state:Agenda,ticket:Ticket):boolean {
+  return ticket.state==='Coding'&&!ticket.started&&dependenciesDone(state,ticket);
 }
 export function gateStamp(state:Agenda,ticket:Ticket,role:Exclude<GateKind,'closure'>,facts:Facts):GateStamp|null {
   const issue=facts.issues.find(issue=>sameRef(issue.ref,ticket.issue));
@@ -102,9 +106,16 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
     }
     if(ticket.state==='Reviewing'||ticket.state==='Merging'){
       const pr=sourcePr(ticket,facts);
+      // A new head or description of the same open PR restarts review on its new fingerprint; only Merging pins the approved one.
+      // GitHub fixes a PR's head repository and branch at creation, so only these fields can legitimately move.
+      if(ticket.state==='Reviewing'&&pr?.state.kind==='open'&&ticket.pr&&(pr.head!==ticket.pr.head||pr.body!==ticket.pr.body||pr.title!==ticket.pr.title)){
+        ticket.pr={...ticket.pr,head:pr.head,title:pr.title,body:pr.body};
+        note(ticket,'system','sourceChange',`Open PR changed to head ${pr.head}; gates restart on the new fingerprint.`,at);
+      }
       const review=gateStamp(state,ticket,'review',facts),accept=gateStamp(state,ticket,'accept',facts);
-      if(!pr||!review||!accept||ticket.gates.review&&canonical(ticket.gates.review.stamp)!==canonical(review)||ticket.gates.accept&&canonical(ticket.gates.accept.stamp)!==canonical(accept)){
-        escalate(ticket,'PR head, target, closing link, body, or review contract changed; fresh gates are required.',at);
+      const stale=ticket.gates.review&&canonical(ticket.gates.review.stamp)!==canonical(review)||ticket.gates.accept&&canonical(ticket.gates.accept.stamp)!==canonical(accept);
+      if(!pr||!review||!accept||stale&&ticket.state==='Merging'){
+        escalate(ticket,ticket.state==='Merging'?'PR head, target, closing link, body, or review contract changed after approval; fresh gates are required.':'PR is closed, missing, retargeted, or no longer closes exactly this issue.',at);
       }else if(pr.checks.kind==='unknown'){
         escalate(ticket,`Required CI observations cannot be verified: ${pr.checks.reason}`,at,'checks');
       }else if(pr.mergeable==='draft'){
@@ -114,9 +125,13 @@ export function reconcile(state:Agenda,facts:Facts,at:number):void {
         note(ticket,'system',pr.mergeable==='no'||pr.mergeable==='behind'?'conflict':'checks',
           pr.mergeable==='no'?'PR conflicts with the target.':pr.mergeable==='behind'?'GitHub requires this branch to be updated with the target.':JSON.stringify(pr.checks),at);
       }else if(ticket.state==='Reviewing'){
-        ticket.gates.review??=pending(review);ticket.gates.accept??=pending(accept);
-        if(ticket.gates.review.status==='passed'&&ticket.gates.accept.status==='passed'&&mergeReady(ticket,pr,facts)&&dependenciesDone(state,ticket)){
-          ticket.state='Merging';enqueue(state,ticket.id,{kind:'merge',issue:ticket.issue,pr:pr.ref,head:pr.head,target:ticket.target,stampHash:digest({review,accept})});
+        if(stale)invalidate(ticket);
+        // Gates open only on a mergeable PR with passing required checks.
+        if(mergeReady(ticket,pr,facts)){
+          ticket.gates.review??=pending(review);ticket.gates.accept??=pending(accept);
+          if(ticket.gates.review.status==='passed'&&ticket.gates.accept.status==='passed'&&dependenciesDone(state,ticket)){
+            ticket.state='Merging';enqueue(state,ticket.id,{kind:'merge',issue:ticket.issue,pr:pr.ref,head:pr.head,target:ticket.target,stampHash:digest({review,accept})});
+          }
         }
       }
     }
@@ -247,6 +262,20 @@ export function failEffect(state:Agenda,effect:Effect,error:PortError,uncertain:
   if(ticket)escalate(ticket,`Effect ${effect.id} ${effect.state.kind}: ${error.message}`,at,'escalation');
   else if(state.closure){state.closure.state='Escalated';state.closure.revision++;state.closure.notes.push(`Effect ${effect.id}: ${error.message}`);}
 }
+/**
+ * A seat that left its still-current revision without a handoff, or could not be seated at all, needs Main's
+ * ruling rather than an automatic relaunch loop. Superseded seats return false: their successor is already due.
+ */
+export function abandonSeat(state:Agenda,ticketId:string,role:Role,revision:number,reason:string,at:number):boolean {
+  const ticket=state.tickets.find(ticket=>ticket.id===ticketId);
+  if(ticket){
+    if(ticket.revision!==revision||!availableRoles(state,ticket).includes(role))return false;
+    escalate(ticket,`The ${role} seat ended without a handoff: ${reason}`,at,'escalation');return true;
+  }
+  const closure=state.closure;
+  if(closure?.id!==ticketId||role!=='closure'||closure.revision!==revision||closure.state!=='Reviewing'||closure.gate.status!=='pending')return false;
+  closure.state='Escalated';closure.revision++;closure.notes.push(`The closure seat ended without a handoff: ${reason}`);return true;
+}
 
 export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,facts:Facts,at:number):Result<Agenda,DomainError> {
   const next=structuredClone(state);
@@ -261,7 +290,17 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
   if(!('ticketId' in operation))return reject('invalidTransition','Operation is not a ticket transition');
   const ticket=next.tickets.find(ticket=>ticket.id===operation.ticketId),closure=next.closure?.id===operation.ticketId?next.closure:null;
   if(!ticket&&!closure)return reject('notFound','Unknown ticket');
-  if(!('revision' in operation)||operation.revision!==(ticket?.revision??closure?.revision))return reject('staleRevision',caller.kind==='seat'?'This seat revision has been superseded. Exit; Main must launch a fresh seat.':'Read the current ticket revision');
+  if(operation.op==='launch'){
+    if(!main)return reject('unauthorized','Only the attached Main puts a ticket on the table');
+    if(!ticket)return reject('invalidTransition','The parent closure seat is relayed automatically once every ticket is Done');
+    if(ticket.started)return reject('invalidTransition','This ticket is already on the table; the roundtable relays its seats until it is Done or Escalated');
+    if(ticket.state==='Escalated'||ticket.state==='Done')return reject('invalidTransition','Resolve an Escalated ticket before launching it; a Done ticket needs no seat');
+    if(!dependenciesDone(next,ticket))return reject('invalidTransition','Every dependency must be Done before this ticket is launched');
+    // The optional role only names a seat the ticket's current stage already offers; every such seat starts either way.
+    if(operation.role&&!availableRoles(next,ticket).includes(operation.role))return reject('invalidTransition',`This ticket's current stage does not offer a ${operation.role} seat`);
+    ticket.started=true;next.version++;return {ok:true,value:next};
+  }
+  if(!('revision' in operation)||operation.revision!==(ticket?.revision??closure?.revision))return reject('staleRevision',caller.kind==='seat'?'This seat revision has been superseded. Exit; the roundtable relays a fresh seat.':'Read the current ticket revision');
   const seat=caller.kind==='seat'&&caller.ticketId===operation.ticketId&&caller.revision===operation.revision;
   if(operation.op==='resolve'){
     if(!main)return reject('unauthorized','Only the attached Main may resolve');

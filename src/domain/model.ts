@@ -22,6 +22,7 @@ export type PortInput = z.infer<typeof portInputSchema>;
 export type ToolParameters = z.infer<typeof toolParametersSchema>;
 export type Role = z.infer<typeof roleSchema>;
 export type GateKind = Exclude<Role,'owner'>;
+export const SEAT_ROLES=['owner','review','accept','postMerge','closure'] as const satisfies readonly Role[];
 export type Action = z.infer<typeof actionSchema>;
 export const lifecycleEventSchema = object({ id: text, at: millisSchema });
 export type LifecycleEvent = z.infer<typeof lifecycleEventSchema>;
@@ -110,7 +111,7 @@ export const ticketSchema = object({
   id:idSchema,revision,issue:issueRefSchema,target:targetSchema,dependsOn:z.array(idSchema),
   contract:object({revision,bodyHash:hashSchema,body:z.string()}),
   state:z.enum(['Coding','Publishing','Reviewing','Merging','Verifying','Escalated','Done']),
-  ownerSessionFile:text.nullable(),
+  ownerSessionFile:text.nullable(),started:z.boolean(),
   pr:object({ref:prRefSchema.nullable(),headRepo:repoSchema,branch:text,head:shaSchema,title:text,body:z.string()}).nullable(),
   gates:object({review:gateRecordSchema.nullable(),accept:gateRecordSchema.nullable(),postMerge:gateRecordSchema.nullable()}),
   rulings:z.array(object({at:millisSchema,summary:text})),

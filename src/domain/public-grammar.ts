@@ -42,7 +42,7 @@ export function buildPublicGrammar(z: PublicZ) {
     object({op:z.literal('resume'),agenda:idSchema,operatorConfirmedOriginalSessionEnded:z.literal(true)}),
     object({op:z.literal('tickets')}),object({op:z.literal('status')}),
     object({op:z.literal('read'),ticketId:idSchema}),
-    object({op:z.literal('launch'),ticketId:idSchema,role:roleSchema}),
+    object({op:z.literal('launch'),ticketId:idSchema,role:roleSchema.optional()}),
     object({op:z.literal('submit'),ticketId:idSchema,revision,branch:text,head:shaSchema,title:text,body:text}),
     object({op:z.literal('verdict'),ticketId:idSchema,revision,role:z.enum(['review','accept','postMerge','closure']),ok:z.boolean(),note:text}),
     object({op:z.literal('escalate'),ticketId:idSchema,revision,kind:z.enum(['question','blocked','split','noCode']),reason:text}),

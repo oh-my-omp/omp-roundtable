@@ -29,8 +29,11 @@ export interface AgendaFiles {
   save(expectedVersion:number|null,state:Agenda):Promise<Result<null,StateError>>;
 }
 export type FileMetrics = {replaces:number;unchangedReplaces:number};
-export type SeatLaunch = {agendaId:string;ticketId:string;revision:number;role:Role;agent:string;cwd:string;sourceSessionFile:string|null;prompt:string;ticket:Ticket|ClosureGate;workspace:Target};
+/** Where a seat works: an Owner fork reuses its predecessor's checkout; every other seat gets a fresh detached worktree at an exact commit. `pull` names the PR whose head ref carries `sha`. */
+export type SeatWorkspace={kind:'fork';sessionFile:string}|{kind:'base';target:Target}|{kind:'commit';repo:Repo;sha:Sha;pull:number|null};
+export type SeatLaunch = {agendaId:string;ticketId:string;revision:number;role:Role;agent:string;cwd:string;prompt:string;ticket:Ticket|ClosureGate;workspace:SeatWorkspace};
 export type SeatHandle = {agentId:string;sessionFile:string;jobId:string};
+export type SeatExit = {ticketId:string;role:Role;revision:number};
 export interface HostPort {
   bind(ctx:ExtensionContext):Result<Caller,PortError>;
   launch(input:SeatLaunch):Promise<Result<SeatHandle,PortError>>;
