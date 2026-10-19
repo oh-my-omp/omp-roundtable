@@ -1,7 +1,7 @@
 import {execFile} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
-import {mkdir,mkdtemp,readdir,rm} from 'node:fs/promises';
-import {basename,dirname,join,resolve} from 'node:path';
+import {access,mkdir,readdir,rm} from 'node:fs/promises';
+import {dirname,join,resolve} from 'node:path';
 import {promisify} from 'node:util';
 import {createAgentSession,z,type AgentSession,type ExtensionContext} from '@oh-my-pi/pi-coding-agent';
 import type {ToolDefinition} from '@oh-my-pi/pi-coding-agent/extensibility/extensions/types';
@@ -14,25 +14,65 @@ import {resolveAgentModelSelection} from '@oh-my-pi/pi-coding-agent/config/model
 import {initializeExtensions} from '@oh-my-pi/pi-coding-agent/modes/runtime-init';
 import {buildPublicGrammar} from '../domain/public-grammar.ts';
 import {parseToolParameters} from '../domain/parse.ts';
-import type {Caller,PortError,PortInput,Result} from '../domain/model.ts';
-import type {HostPort,SeatLaunch} from './contracts.ts';
+import type {Caller,PortInput,Repo,Result,Role} from '../domain/model.ts';
+import type {HostPort,SeatExit,SeatLaunch,SeatWorkspace} from './contracts.ts';
 import type {ControllerOutput,RuntimeError} from '../runtime/controller.ts';
 
 const runFile=promisify(execFile);
 const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string())}).strict();
 const handoffSchema=z.object({ticketId:z.string(),notes:z.number().int().nonnegative(),rulings:z.number().int().nonnegative()}).strict();
 type LiveSeat={input:SeatLaunch;session:AgentSession|null;done:Promise<void>};
-export type HostOptions={sessionDir:string;ticketRevision:(ticketId:string)=>number|null;execute:(caller:Caller,input:PortInput,cwd:string)=>Promise<Result<ControllerOutput,RuntimeError>>;onExit:(ticketId:string,handedOff:boolean,error:string|null)=>void};
+type Worktree={bare:string;path:string};
+export type HostOptions={dataDir:string;ticketRevision:(ticketId:string)=>number|null;execute:(caller:Caller,input:PortInput)=>Promise<Result<ControllerOutput,RuntimeError>>;onExit:(seat:SeatExit,handedOff:boolean,error:string|null)=>void;onSeatError:(ticketId:string,message:string)=>void};
+async function git(args:readonly string[]):Promise<string>{const {stdout}=await runFile('git',[...args]);return stdout.trim();}
 
-/** Owns only the sessions it creates; the native registry owns their identities. */
+/** Owns only the sessions and worktrees it creates; the native registry owns their identities. */
 export function createHostPort(options:HostOptions):HostPort {
   const registry=AgentRegistry.global();
   const seats=new Map<string,LiveSeat>();
+  const reposDir=join(options.dataDir,'repos'),worktreesDir=join(options.dataDir,'worktrees'),sessionsDir=join(options.dataDir,'sessions');
+  // git holds ref and worktree-admin locks per repository, so every operation on one bare cache runs in order.
+  const locks=new Map<string,Promise<unknown>>();
+  function locked<T>(bare:string,work:()=>Promise<T>):Promise<T> {
+    const result=(locks.get(bare)??Promise.resolve()).then(work);
+    locks.set(bare,result.catch(()=>{}));
+    return result;
+  }
   let disposed=false;
   function main():AgentSession {
     const root=registry.get(MAIN_AGENT_ID);
     if(!root?.session||root.kind!=='main'||root.status==='aborted')throw new Error('The native Main session is unavailable');
     return root.session;
+  }
+  /**
+   * A detached worktree of the repository's bare cache at exactly the commit the seat must build on or judge.
+   * The cache is cloned once and fetched before every checkout; seats never clone from the network.
+   */
+  async function checkout(agendaId:string,seatId:string,cwd:string,spec:Exclude<SeatWorkspace,{kind:'fork'}>):Promise<Worktree> {
+    const repo=spec.kind==='base'?spec.target.repo:spec.repo;
+    const bare=join(reposDir,`${repo.owner}__${repo.name}.git`.toLowerCase());
+    return locked(bare,async()=>{
+      if(!await access(join(bare,'HEAD')).then(()=>true,()=>false)){
+        await rm(bare,{recursive:true,force:true});await mkdir(reposDir,{recursive:true,mode:0o700});
+        await runFile('gh',['repo','clone',`${repo.owner}/${repo.name}`,bare,'--','--bare','--quiet'],{cwd});
+        // A bare clone has no remote-tracking refspec; worktrees then fetch and track origin like an ordinary clone.
+        await git(['-C',bare,'config','remote.origin.fetch','+refs/heads/*:refs/remotes/origin/*']);
+      }
+      await git(['-C',bare,'fetch','--prune','--quiet','origin']);
+      let commit:string;
+      if(spec.kind==='base')commit=await git(['-C',bare,'rev-parse','--verify',`refs/remotes/origin/${spec.target.base}^{commit}`]);
+      else {
+        // A fork PR head lives only under the base repository's pull ref, not its branches.
+        if(spec.pull!==null)await git(['-C',bare,'fetch','--quiet','origin',`+refs/pull/${spec.pull}/head:refs/roundtable/pull/${spec.pull}`]);
+        commit=spec.sha;
+      }
+      const tree={bare,path:join(worktreesDir,agendaId,seatId)};
+      await mkdir(dirname(tree.path),{recursive:true,mode:0o700});
+      await git(['-C',bare,'worktree','add','--detach','--quiet',tree.path,`${commit}^{commit}`]);
+      const head=await git(['-C',tree.path,'rev-parse','HEAD']);
+      if(head!==commit){await git(['-C',bare,'worktree','remove','--force',tree.path]);throw new Error(`Seat worktree is at ${head}, not the required ${commit}`);}
+      return tree;
+    });
   }
   return {
     bind(ctx){
@@ -50,7 +90,8 @@ export function createHostPort(options:HostOptions):HostPort {
       const id=`Rt${randomUUID().replaceAll('-','')}`;
       // This is a lifecycle reservation, not an observation of a native session.
       const seat:LiveSeat={input,session:null,done:Promise.resolve()};seats.set(id,seat);
-      let manager:SessionManager|undefined,workspace:string|undefined,ephemeralWorkspace=false;
+      let manager:SessionManager|undefined,tree:Worktree|null=null;
+      const fork=input.workspace.kind==='fork'?input.workspace.sessionFile:null;
       try {
         const parent=main();
         if(!parent.asyncJobManager)throw new Error('Roundtable requires the native async job manager');
@@ -59,19 +100,19 @@ export function createHostPort(options:HostOptions):HostPort {
         const agent=getAgent([...discovery.agents,...parent.getSessionAgents()],input.agent);
         if(!agent||cfgTaskDisabledAgents.get(parent.settings).includes(input.agent))throw new Error(`Configured seat agent is unavailable: ${input.agent}`);
         if(agent.blocking)throw new Error('Roundtable requires a nonblocking seat agent');
-        const sessionDir=join(options.sessionDir,input.agendaId);
+        const sessionDir=join(sessionsDir,input.agendaId);
         await mkdir(sessionDir,{recursive:true,mode:0o700});
-        if(input.sourceSessionFile){
+        let workspace:string;
+        if(input.workspace.kind==='fork'){
           if(input.role!=='owner')throw new Error('Gate sessions must never inherit history');
-          const prior=await SessionManager.peekSessionInit(input.sourceSessionFile);
+          const prior=await SessionManager.peekSessionInit(input.workspace.sessionFile);
           if(!prior)throw new Error('Owner fork source has no native session contract');
           workspace=prior.cwd;
-          manager=await SessionManager.forkFrom(input.sourceSessionFile,workspace,sessionDir,undefined,{copyArtifacts:false,suppressBreadcrumb:true});
+          // The controller forks only after the predecessor seat exited and flushed. A tail cut by
+          // that exit is repaired into a valid transcript, and the fork does not re-bill inherited spend.
+          manager=await SessionManager.forkFrom(input.workspace.sessionFile,workspace,sessionDir,undefined,{copyArtifacts:false,suppressBreadcrumb:true,resetInheritedCost:true,repairInterruptedTail:true});
         }else{
-          const root=await mkdtemp('/tmp/roundtable-seat-');
-          workspace=join(root,'repo');ephemeralWorkspace=input.role!=='owner';
-          await runFile('gh',['repo','clone',`${input.workspace.repo.owner}/${input.workspace.repo.name}`,workspace,'--','--quiet'],{cwd:input.cwd});
-          await runFile('git',['checkout','--detach',`origin/${input.workspace.base}`],{cwd:workspace});
+          tree=await checkout(input.agendaId,id,input.cwd,input.workspace);workspace=tree.path;
           manager=SessionManager.create(workspace,sessionDir);
           await manager.ensureOnDisk();
         }
@@ -82,9 +123,9 @@ export function createHostPort(options:HostOptions):HostPort {
           if(entry.customType==='roundtable-handoff')previousHandoff=entry.data;
         }
         const savedContract=contractSchema.safeParse(inheritedContract);
-        if(input.sourceSessionFile&&!savedContract.success)throw new Error('Owner session is missing its original prompt/tool contract');
+        if(fork&&!savedContract.success)throw new Error('Owner session is missing its original prompt/tool contract');
         const handoff=handoffSchema.safeParse(previousHandoff);
-        if(input.sourceSessionFile&&(!handoff?.success||handoff.data.ticketId!==input.ticketId))throw new Error('Owner fork source does not contain this ticket’s accepted handoff');
+        if(fork&&(!handoff?.success||handoff.data.ticketId!==input.ticketId))throw new Error('Owner fork source does not contain this ticket’s accepted handoff');
         let handedOff=false;
         const caller:Caller={kind:'seat',agentId:id,sessionId:manager.getSessionId(),sessionFile,ticketId:input.ticketId,revision:input.revision,role:input.role};
         const nativeManager=manager;
@@ -95,7 +136,7 @@ export function createHostPort(options:HostOptions):HostPort {
               if(!current?.session||current.session!==seat.session)return {content:[{type:'text',text:'Native seat identity changed.'}],details:null,isError:true};
               const parsed=parseToolParameters(params);
               if(!parsed.ok)return {content:[{type:'text',text:JSON.stringify(parsed.error)}],details:null,isError:true};
-              const response=await options.execute(caller,parsed.value.input,workspace!);
+              const response=await options.execute(caller,parsed.value.input);
               if(response.ok&&['submit','verdict','escalate'].includes(parsed.value.input.op)){
                 handedOff=true;
                 if(input.role==='owner'&&'ticket' in response.value&&'ownerSessionFile' in response.value.ticket){
@@ -116,8 +157,8 @@ export function createHostPort(options:HostOptions):HostPort {
         const cacheKey=manager.getHeader()?.providerPromptCacheKey??manager.getHeader()?.id;
         const created=await createAgentSession({cwd:workspace,sessionManager:manager,authStorage:parent.modelRegistry.authStorage,modelRegistry:parent.modelRegistry,
           credentialSourceSessionId:parent.sessionManager.getSessionId(),settings:createSubagentSettings(parent.settings),
-          ...(!input.sourceSessionFile&&modelSelection.patterns?{modelPattern:modelSelection.patterns}:{}),
-          ...(input.sourceSessionFile&&cacheKey?{providerPromptCacheKey:cacheKey,providerPromptCacheKeySource:'fork' as const}:{}),
+          ...(!fork&&modelSelection.patterns?{modelPattern:modelSelection.patterns}:{}),
+          ...(fork&&cacheKey?{providerPromptCacheKey:cacheKey,providerPromptCacheKeySource:'fork' as const}:{}),
           ...(savedContract.success?{systemPrompt:savedContract.data.systemPrompt}:{appendSystemPrompt:agent.systemPrompt}),
           customTools:[tool],disableExtensionDiscovery:true,toolNames:tools,restrictToolNames:true,allowRestrictedCustomTools:true,
           hasUI:false,bindProcessState:false,cacheWarming:false,enableIrc:false,enableMCP:false,
@@ -125,15 +166,16 @@ export function createHostPort(options:HostOptions):HostPort {
           spawns:'',inheritedSessionAgents:parent.getSessionAgents(),
         });
         seat.session=created.session;
-        if(!input.sourceSessionFile){
+        if(!fork){
           manager.appendCustomEntry('roundtable-session-contract',{systemPrompt:created.session.systemPrompt,tools});
           manager.appendSessionInit({systemPrompt:created.session.systemPrompt.join('\n\n'),task:input.prompt,tools,agent:agent.name,readOnly:input.role!=='owner',spawns:''});
         }
-        await initializeExtensions(created.session,{reportSendError:(_action,error)=>options.onExit(input.ticketId,false,error.message),reportRuntimeError:error=>options.onExit(input.ticketId,false,error.error)});
-        const prompt=input.sourceSessionFile&&handoff?.success
+        await initializeExtensions(created.session,{reportSendError:(_action,error)=>options.onSeatError(input.ticketId,error.message),reportRuntimeError:error=>options.onSeatError(input.ticketId,error.error)});
+        const prompt=fork&&handoff?.success
           ? `Continue ticket ${input.ticketId} at revision ${input.revision}. Only the incremental handoff follows. Call roundtable read if the current contract or PR is needed.\n${JSON.stringify({notes:input.ticket.notes.slice(handoff.data.notes),rulings:input.ticket.rulings.slice(handoff.data.rulings)})}`
           : input.prompt;
-        const session=created.session,ownedWorkspace=workspace,cleanupWorkspace=ephemeralWorkspace;
+        // The Owner's checkout outlives the seat for rework forks until finish; a gate checkout ends with its seat.
+        const session=created.session,disposable=input.role==='owner'?null:tree;
         // Like native terminal-yield handling, abort the obsolete tool loop at a
         // tool-completion boundary. Accepted handoffs have already saved their
         // checkpoint and must finish normally, even if their transition bumped revision.
@@ -166,38 +208,30 @@ export function createHostPort(options:HostOptions):HostPort {
             try {await session.dispose();}catch(cause){error??=cause instanceof Error?cause.message:String(cause);}
             seats.delete(id);
             try {
-              if(cleanupWorkspace)await rm(join(ownedWorkspace,'..'),{recursive:true,force:true});
+              if(disposable)await locked(disposable.bare,()=>git(['-C',disposable.bare,'worktree','remove','--force',disposable.path]));
             }catch(cause){error??=cause instanceof Error?cause.message:String(cause);}
-            finally {options.onExit(input.ticketId,handedOff,error);completion.resolve();}
+            finally {options.onExit({ticketId:input.ticketId,role:input.role,revision:input.revision},handedOff,error);completion.resolve();}
           }
         },{ownerId:MAIN_AGENT_ID,agentId:id});
         return {ok:true,value:{agentId:id,sessionFile,jobId}};
       }catch(error){
         seats.delete(id);
         if(seat.session)await seat.session.dispose();else if(manager)await manager.close();
-        if(workspace&&!input.sourceSessionFile)await rm(join(workspace,'..'),{recursive:true,force:true});
-        const detail:PortError={kind:'unavailable',message:error instanceof Error?error.message:String(error)};
-        return {ok:false,error:detail};
+        let detail=error instanceof Error?error.message:String(error);
+        if(tree){const created=tree;try {await locked(created.bare,()=>git(['-C',created.bare,'worktree','remove','--force',created.path]));}catch(cause){detail+=`; worktree cleanup failed: ${cause instanceof Error?cause.message:String(cause)}`;}}
+        return {ok:false,error:{kind:'unavailable',message:detail}};
       }
     },
     async finish(agendaId){
       try {
-        const sessionDir=join(options.sessionDir,agendaId);
-        if(dirname(resolve(sessionDir))!==resolve(options.sessionDir))throw new Error('Invalid agenda session directory');
-        let names:string[];
-        try {names=await readdir(sessionDir);}catch(error){
-          if(typeof error==='object'&&error!==null&&'code' in error&&error.code==='ENOENT')return {ok:true,value:null};
-          throw error;
-        }
-        const roots=new Set<string>();
-        for(const name of names){
-          if(!name.endsWith('.jsonl'))continue;
-          const file=join(sessionDir,name);
-          const prior=await SessionManager.peekSessionInit(file);
-          if(!prior)throw new Error(`Cannot inspect Owner workspace for ${file}`);
-          const root=dirname(prior.cwd);
-          if(basename(prior.cwd)!=='repo'||!basename(root).startsWith('roundtable-seat-')||root!==join('/tmp',basename(root)))throw new Error('Refusing to remove a workspace not created by this seat host');
-          if(!roots.has(root)){await rm(root,{recursive:true,force:true});roots.add(root);}
+        const root=join(worktreesDir,agendaId);
+        if(dirname(resolve(root))!==resolve(worktreesDir))throw new Error('Invalid agenda worktree directory');
+        if(!await access(root).then(()=>true,()=>false))return {ok:true,value:null};
+        // Every Owner checkout of this agenda lives under its root; pruning drops their admin entries from each cache.
+        await rm(root,{recursive:true,force:true});
+        for(const name of await readdir(reposDir))if(name.endsWith('.git')){
+          const bare=join(reposDir,name);
+          await locked(bare,()=>git(['-C',bare,'worktree','prune']));
         }
         return {ok:true,value:null};
       }catch(error){return {ok:false,error:{kind:'unavailable',message:error instanceof Error?error.message:String(error)}};}

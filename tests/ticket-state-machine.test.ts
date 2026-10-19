@@ -253,6 +253,39 @@ describe('ticket delivery lifecycle',()=>{
     expect(agenda).toEqual(escalated);
   });
 
+  test('review and accept open only once the PR is mergeable with passing required checks',()=>{
+    const submitted=unwrap(applyOperation(conveneTicket(),{op:'submit',ticketId:TICKET,revision:1,branch:BRANCH,head:HEAD,title:PR_TITLE,body:PR_BODY},seat('owner',OWNER_SESSION,1),openSource(),AT),'owner submit');
+    const effect=effectOf(submitted,item=>item.action.kind==='publishPr');
+    const facts=scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'});
+    const pr=facts.prs[0]!;pr.mergeable='unknown';
+    const published=satisfiedResult(submitted,effect,facts);
+    if(!published)throw new Error('publication was not source-confirmed');
+    confirmEffect(submitted,effect,published,facts,AT);
+    expect(ticketOf(submitted).state).toBe('Reviewing');
+    expect(availableRoles(submitted,ticketOf(submitted))).toEqual([]);
+
+    pr.mergeable='yes';pr.checks={kind:'pending',required:[{identity:{name:'ci',source:{kind:'any'}},head:HEAD}]};
+    reconcile(submitted,facts,AT+1);
+    expect(availableRoles(submitted,ticketOf(submitted))).toEqual([]);
+
+    pr.checks={kind:'passing',required:[]};
+    reconcile(submitted,facts,AT+2);
+    expect(availableRoles(submitted,ticketOf(submitted))).toEqual(['review','accept']);
+  });
+
+  test('a new head on the open PR restarts both gates on its fingerprint instead of escalating',()=>{
+    const {agenda,facts}=publishTicket();
+    const revision=ticketOf(agenda).revision;
+    const reviewed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision,role:'review',ok:true,note:'Review approves.'},seat('review',REVIEW_SESSION,revision),facts,AT),'review verdict');
+    reconcile(reviewed,scenario({prHead:DRIFTED_HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'}),AT+1);
+    const ticket=ticketOf(reviewed);
+    expect(ticket.state).toBe('Reviewing');
+    expect(ticket.revision).toBe(revision+1);
+    expect(ticket.pr?.head).toBe(DRIFTED_HEAD);
+    expect(ticket.gates.review).toMatchObject({status:'pending',stamp:{head:DRIFTED_HEAD}});
+    expect(ticket.gates.accept).toMatchObject({status:'pending',stamp:{head:DRIFTED_HEAD}});
+  });
+
   test('a contract body change after both approvals escalates without an authorized merge',()=>{
     const {agenda,facts}=driveToMerging();
     const mergeEffect=effectOf(agenda,item=>item.action.kind==='merge');
