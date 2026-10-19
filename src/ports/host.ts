@@ -22,7 +22,7 @@ const runFile=promisify(execFile);
 const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string())}).strict();
 const handoffSchema=z.object({ticketId:z.string(),notes:z.number().int().nonnegative(),rulings:z.number().int().nonnegative()}).strict();
 type LiveSeat={input:SeatLaunch;session:AgentSession|null;done:Promise<void>};
-export type HostOptions={sessionDir:string;execute:(caller:Caller,input:PortInput,cwd:string)=>Promise<Result<ControllerOutput,RuntimeError>>;onExit:(ticketId:string,handedOff:boolean,error:string|null)=>void};
+export type HostOptions={sessionDir:string;ticketRevision:(ticketId:string)=>number|null;execute:(caller:Caller,input:PortInput,cwd:string)=>Promise<Result<ControllerOutput,RuntimeError>>;onExit:(ticketId:string,handedOff:boolean,error:string|null)=>void};
 
 /** Owns only the sessions it creates; the native registry owns their identities. */
 export function createHostPort(options:HostOptions):HostPort {
@@ -134,6 +134,14 @@ export function createHostPort(options:HostOptions):HostPort {
           ? `Continue ticket ${input.ticketId} at revision ${input.revision}. Only the incremental handoff follows. Call roundtable read if the current contract or PR is needed.\n${JSON.stringify({notes:input.ticket.notes.slice(handoff.data.notes),rulings:input.ticket.rulings.slice(handoff.data.rulings)})}`
           : input.prompt;
         const session=created.session,ownedWorkspace=workspace,cleanupWorkspace=ephemeralWorkspace;
+        // Like native terminal-yield handling, abort the obsolete tool loop at a
+        // tool-completion boundary. Accepted handoffs have already saved their
+        // checkpoint and must finish normally, even if their transition bumped revision.
+        const unsubscribe=session.subscribe(event=>{
+          if(event.type!=='tool_execution_end'||handedOff)return;
+          const revision=options.ticketRevision(input.ticketId);
+          if(revision!==null&&revision!==input.revision)session.agent.abort('Roundtable seat revision was superseded');
+        });
         const completion=Promise.withResolvers<void>();
         seat.done=completion.promise;
         const jobId=parent.asyncJobManager.register('task',`${input.role}: ${input.ticketId}`,async({signal})=>{
@@ -154,6 +162,7 @@ export function createHostPort(options:HostOptions):HostPort {
             throw cause;
           }finally {
             signal.removeEventListener('abort',abort);
+            unsubscribe();
             try {await session.dispose();}catch(cause){error??=cause instanceof Error?cause.message:String(cause);}
             seats.delete(id);
             try {

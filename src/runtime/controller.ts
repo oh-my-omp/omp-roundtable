@@ -28,6 +28,11 @@ export class RoundtableController {
     if(this.main&&this.main.sessionId!==caller.sessionId)throw new Error('The coordinator session cannot change within a run');
     this.main=caller;
   }
+  /** The agenda owns ticket revisions; the host uses this only to end superseded seat lifetimes. */
+  ticketRevision(ticketId:string):number|null {
+    if(this.state?.lifecycle!=='active')return null;
+    return this.state.tickets.find(ticket=>ticket.id===ticketId)?.revision??(this.state.closure?.id===ticketId?this.state.closure.revision:null);
+  }
   visible(caller:Caller):boolean {
     if(this.closed||!this.main)return false;
     if(caller.kind==='main')return caller.agentId===this.main.agentId&&caller.sessionId===this.main.sessionId;

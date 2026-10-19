@@ -379,3 +379,50 @@ test('Main revoking noCode cancels its queued close before coding resumes',()=>{
   expect(effectOf(agenda,effect=>effect.action.kind==='setIssueState').state.kind).toBe('cancelled');
   expect(effectPrecondition(agenda,close,facts)).not.toBeNull();
 });
+
+test('postMerge keeps its merge anchor across independent target advances but rejects lost ancestry',()=>{
+  const {agenda}=driveToMerging();
+  const mergedFacts=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'merge-close',at:MERGED_AT}});
+  const effect=effectOf(agenda,item=>item.action.kind==='merge');
+  const result=satisfiedResult(agenda,effect,mergedFacts);
+  if(!result)throw new Error('Merge was not source-confirmed');
+  confirmEffect(agenda,effect,result,mergedFacts,AT);
+  const revision=ticketOf(agenda).revision,stamp=structuredClone(ticketOf(agenda).gates.postMerge?.stamp);
+  const advanced=scenario({prHead:HEAD,baseHead:DRIFTED_HEAD,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'merge-close',at:MERGED_AT}});
+  advanced.commits.push({repo:REPO,ancestor:MERGE,descendant:DRIFTED_HEAD,result:'contains'});
+  reconcile(agenda,advanced,AT+1);
+  expect(ticketOf(agenda).revision).toBe(revision);
+  expect(ticketOf(agenda).gates.postMerge?.stamp).toEqual(stamp);
+  const lost=structuredClone(agenda),rewritten=structuredClone(advanced);
+  rewritten.commits[0]!.result='notContained';
+  reconcile(lost,rewritten,AT+2);
+  expect(ticketOf(lost).state).toBe('Escalated');
+  expect(ticketOf(lost).gates.postMerge).toBeNull();
+  const passed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision,role:'postMerge',ok:true,note:'Target still contains the exact merge after an independent delivery.'},seat('postMerge',POST_MERGE_SESSION,revision),advanced,AT+3),'stable postMerge');
+  expect(ticketOf(passed).state).toBe('Done');
+});
+
+test('closure fingerprints survive unrelated forward merges but reject lost child ancestry',()=>{
+  const parent={repo:REPO,number:1};
+  const source=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'child-close',at:MERGED_AT}});
+  source.issues.push({...issueSnapshot('open',null),ref:parent,children:[ISSUE]});
+  let agenda=unwrap(createAgenda({op:'convene',parent,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:PR}]},source,AT,'closure-anchor'),'adopt merged child');
+  agenda=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision:1,role:'postMerge',ok:true,note:'Verified the merged child.'},seat('postMerge',POST_MERGE_SESSION,1),source,AT),'postMerge');
+  const closure=agenda.closure;if(!closure)throw new Error('Expected closure after child Done');
+  const original=structuredClone(closure.gate.stamp),revision=closure.revision;
+  const advanced=structuredClone(source);
+  const base=advanced.repos[0]!.bases[0]!;
+  if(base.state.kind!=='present')throw new Error('Expected target');
+  base.state.head=DRIFTED_HEAD;advanced.repos[0]!.defaultHead=DRIFTED_HEAD;
+  advanced.commits.push({repo:REPO,ancestor:MERGE,descendant:DRIFTED_HEAD,result:'contains'});
+  reconcile(agenda,advanced,AT+1);
+  expect(agenda.closure?.revision).toBe(revision);
+  expect(agenda.closure?.gate.stamp).toEqual(original);
+  const lost=structuredClone(agenda),rewritten=structuredClone(advanced);
+  rewritten.commits[0]!.result='notContained';
+  reconcile(lost,rewritten,AT+2);
+  expect(lost.closure?.state).toBe('Escalated');
+  const caller:Caller={kind:'seat',agentId:'closure',sessionId:'closure',sessionFile:'/tmp/closure.jsonl',ticketId:closure.id,revision,role:'closure'};
+  const passed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:closure.id,revision,role:'closure',ok:true,note:'Every terminal remains contained in the current target.'},caller,advanced,AT+3),'stable closure');
+  expect(passed.closure?.gate.status).toBe('passed');
+});

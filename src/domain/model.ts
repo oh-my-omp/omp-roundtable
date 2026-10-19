@@ -100,8 +100,8 @@ export const terminalSchema = z.union([
 export type Terminal = z.infer<typeof terminalSchema>;
 export const gateStampSchema = z.union([
   object({kind:z.enum(['review','accept']),pr:prRefSchema,head:shaSchema,target:targetSchema,bodyHash:hashSchema,prBodyHash:hashSchema,contractRevision:revision,rulingsHash:hashSchema}),
-  object({kind:z.literal('postMerge'),issue:issueRefSchema,bodyHash:hashSchema,contractRevision:revision,terminal:terminalSchema,target:targetSchema,targetHead:shaSchema,rulingsHash:hashSchema}),
-  object({kind:z.literal('closure'),parent:issueRefSchema,bodyHash:hashSchema,children:z.array(object({id:idSchema,issue:issueRefSchema,terminal:terminalSchema})),targets:z.array(object({target:targetSchema,head:shaSchema})),rulingsHash:hashSchema}),
+  object({kind:z.literal('postMerge'),issue:issueRefSchema,bodyHash:hashSchema,contractRevision:revision,terminal:terminalSchema,target:targetSchema,commit:shaSchema,rulingsHash:hashSchema}),
+  object({kind:z.literal('closure'),parent:issueRefSchema,bodyHash:hashSchema,children:z.array(object({id:idSchema,issue:issueRefSchema,terminal:terminalSchema})),targets:z.array(targetSchema),rulingsHash:hashSchema}),
 ]);
 export type GateStamp = z.infer<typeof gateStampSchema>;
 export const gateRecordSchema = object({stamp:gateStampSchema,status:z.enum(['pending','passed','failed']),note:z.string()});

@@ -58,7 +58,7 @@ export function gateStamp(state:Agenda,ticket:Ticket,role:Exclude<GateKind,'clos
     if(terminal?.kind!=='merged'||!head||!contains(facts,ticket.target.repo,terminal.mergeSha,head))return null;
     const pr=facts.prs.find(pr=>sameRef(pr.ref,terminal.pr));
     if(pr?.state.kind!=='merged'||pr.state.sha!==terminal.mergeSha||!sameTarget(pr.target,ticket.target))return null;
-    return {kind:'postMerge',issue:ticket.issue,bodyHash:issue.bodyHash,contractRevision:ticket.contract.revision,terminal,target:ticket.target,targetHead:head,rulingsHash:digest(ticket.rulings)};
+    return {kind:'postMerge',issue:ticket.issue,bodyHash:issue.bodyHash,contractRevision:ticket.contract.revision,terminal,target:ticket.target,commit:terminal.mergeSha,rulingsHash:digest(ticket.rulings)};
   }
   const pr=ticket.pr?.ref?facts.prs.find(pr=>sameRef(pr.ref,ticket.pr!.ref!)):undefined;
   if(!pr||pr.state.kind!=='open'||pr.head!==ticket.pr?.head||!sameTarget(pr.target,ticket.target)||!exactClosingBody(pr.body,ticket.issue,pr.ref.repo)||pr.closes.length!==1||!sameRef(pr.closes[0]!,ticket.issue))return null;
@@ -68,14 +68,14 @@ function closureStamp(state:Agenda,facts:Facts):GateStamp|null {
   if(!state.parent||state.tickets.some(ticket=>ticket.state!=='Done'||!ticket.terminal))return null;
   const parent=facts.issues.find(issue=>sameRef(issue.ref,state.parent!));
   if(!parent||parent.children.some(child=>!state.tickets.some(ticket=>sameRef(ticket.issue,child))))return null;
-  const targets:{target:Ticket['target'];head:string}[]=[];
+  const targets:Ticket['target'][]=[];
   const children:{id:string;issue:Ticket['issue'];terminal:NonNullable<Ticket['terminal']>}[]=[];
   for(const ticket of state.tickets){
     const issue=facts.issues.find(issue=>sameRef(issue.ref,ticket.issue));
     if(issue?.state!=='closed'||issue.bodyHash!==ticket.contract.bodyHash||!ticket.terminal)return null;
     const head=targetHead(facts,ticket.target);if(!head)return null;
     if(ticket.terminal.kind==='merged'&&!contains(facts,ticket.target.repo,ticket.terminal.mergeSha,head))return null;
-    if(!targets.some(item=>sameTarget(item.target,ticket.target)))targets.push({target:ticket.target,head});
+    if(!targets.some(item=>sameTarget(item,ticket.target)))targets.push(ticket.target);
     children.push({id:ticket.id,issue:ticket.issue,terminal:ticket.terminal});
   }
   return {kind:'closure',parent:state.parent,bodyHash:parent.bodyHash,children,targets,rulingsHash:digest(state.closure?.rulings??[])};
@@ -261,7 +261,7 @@ export function applyOperation(state:Agenda,operation:PortInput,caller:Caller,fa
   if(!('ticketId' in operation))return reject('invalidTransition','Operation is not a ticket transition');
   const ticket=next.tickets.find(ticket=>ticket.id===operation.ticketId),closure=next.closure?.id===operation.ticketId?next.closure:null;
   if(!ticket&&!closure)return reject('notFound','Unknown ticket');
-  if(!('revision' in operation)||operation.revision!==(ticket?.revision??closure?.revision))return reject('staleRevision','Read the current ticket revision');
+  if(!('revision' in operation)||operation.revision!==(ticket?.revision??closure?.revision))return reject('staleRevision',caller.kind==='seat'?'This seat revision has been superseded. Exit; Main must launch a fresh seat.':'Read the current ticket revision');
   const seat=caller.kind==='seat'&&caller.ticketId===operation.ticketId&&caller.revision===operation.revision;
   if(operation.op==='resolve'){
     if(!main)return reject('unauthorized','Only the attached Main may resolve');

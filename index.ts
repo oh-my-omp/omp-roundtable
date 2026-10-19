@@ -59,6 +59,7 @@ class ProcessRuntime {
     this.started=true;this.binding={pi,ctx};
     const directory=resolve(ctx.cwd,this.directory.get(root.settings));
     this.host=createHostPort({sessionDir:join(directory,'sessions'),
+      ticketRevision:ticketId=>this.controller?.ticketRevision(ticketId)??null,
       execute:async(caller,input,cwd)=>{
         if(!this.controller)return {ok:false,error:{kind:'domain',error:{kind:'ownershipBlocked',message:'Coordinator has not started'}}};
         return this.controller.execute(caller,input,cwd);
