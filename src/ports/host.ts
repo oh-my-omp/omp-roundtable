@@ -213,6 +213,9 @@ export function createHostPort(options:HostOptions):HostPort {
             finally {options.onExit({ticketId:input.ticketId,role:input.role,revision:input.revision},handedOff,error);completion.resolve();}
           }
         },{ownerId:MAIN_AGENT_ID,agentId:id});
+        // A seat's outcome reaches Main through the ticket (an escalation, or the next launchable ticket), never as a
+        // job completion: Main does not wait on seats. The job stays listed and inspectable.
+        parent.asyncJobManager.acknowledgeDeliveries([jobId]);
         return {ok:true,value:{agentId:id,sessionFile,jobId}};
       }catch(error){
         seats.delete(id);
