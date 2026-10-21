@@ -259,8 +259,22 @@ const cases: Case[] = [
       for (const id of ['C', 'D']) {
         const [first, second] = owners(sessions, id);
         if (!first || !second || second.parent !== first.id) failures.push(`${id} rework Owner is not a fork of its first Owner (${owners(sessions, id).map(item => `${item.id}<-${item.parent}`).join(', ')})`);
+        if (!first || !second) continue;
+        const header = (session: SeatSession) => session.lines.find(line => line.type === 'session');
+        const firstKey = header(first)?.providerPromptCacheKey ?? first.id;
+        if (header(second)?.providerPromptCacheKey !== firstKey) failures.push(`${id} rework Owner prompt cache key is ${String(header(second)?.providerPromptCacheKey)}, not ${String(firstKey)}`);
+        // The fork starts with an empty todo list instead of its predecessor's; the first Owner never writes one.
+        const reset = (session: SeatSession) => session.lines.some(line => line.type === 'custom' && line.customType === 'user_todo_edit' && JSON.stringify(line.data) === '{"phases":[]}');
+        if (reset(first) || !reset(second)) failures.push(`${id} rework Owner did not reset its inherited todo list`);
       }
       for (const gate of sessions.filter(session => session.role !== 'owner')) if (gate.parent) failures.push(`${gate.ticket} ${gate.role} session inherited history`);
+      // Every seat is a full native session: it may delegate and holds its bound roundtable tool.
+      for (const session of sessions) {
+        const init = session.lines.find(line => line.type === 'session_init');
+        const tools = Array.isArray(init?.tools) ? init.tools : [];
+        for (const name of ['task', 'roundtable']) if (!tools.includes(name)) failures.push(`${session.ticket} ${session.role} seat lacks ${name}: ${JSON.stringify(tools)}`);
+        if (init?.spawns !== '*') failures.push(`${session.ticket} ${session.role} seat spawns ${JSON.stringify(init?.spawns)}, not "*"`);
+      }
       if (ticketOf(state, 'E')?.terminal?.kind !== 'noCode') failures.push('E did not finish as noCode');
       if (state?.closure?.state !== 'Done') failures.push('closure is not Done');
       return failures;
