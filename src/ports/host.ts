@@ -9,7 +9,9 @@ import {AgentRegistry,MAIN_AGENT_ID} from '@oh-my-pi/pi-coding-agent/registry/ag
 import {SessionManager} from '@oh-my-pi/pi-coding-agent/session/session-manager';
 import {discoverAgents,getAgent} from '@oh-my-pi/pi-coding-agent/task/discovery';
 import {cfgTaskAgentModelOverrides,cfgTaskDisabledAgents} from '@oh-my-pi/pi-coding-agent/task/settings';
-import {createSubagentSettings} from '@oh-my-pi/pi-coding-agent/task/executor';
+import {createMCPProxyTools,followMCPTools,type MCPToolFollower} from '@oh-my-pi/pi-coding-agent/task/executor';
+import {MCPManager} from '@oh-my-pi/pi-coding-agent/mcp/manager';
+import {USER_TODO_EDIT_CUSTOM_TYPE} from '@oh-my-pi/pi-coding-agent/tools/todo';
 import {resolveAgentModelSelection} from '@oh-my-pi/pi-coding-agent/config/model-resolver';
 import {initializeExtensions} from '@oh-my-pi/pi-coding-agent/modes/runtime-init';
 import {buildPublicGrammar} from '../domain/public-grammar.ts';
@@ -19,7 +21,7 @@ import type {HostPort,SeatExit,SeatLaunch,SeatWorkspace} from './contracts.ts';
 import type {ControllerOutput,RuntimeError} from '../runtime/controller.ts';
 
 const runFile=promisify(execFile);
-const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string())}).strict();
+const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string()),mountedTools:z.array(z.string())}).strict();
 const handoffSchema=z.object({ticketId:z.string(),notes:z.number().int().nonnegative(),rulings:z.number().int().nonnegative()}).strict();
 type LiveSeat={input:SeatLaunch;session:AgentSession|null;done:Promise<void>};
 type Worktree={bare:string;path:string};
@@ -95,7 +97,7 @@ export function createHostPort(options:HostOptions):HostPort {
       // This is a lifecycle reservation, not an observation of a native session.
       const seat:LiveSeat={input,session:null,done:Promise.resolve()};seats.set(id,seat);
       seatedRevisions.add(JSON.stringify([input.ticketId,input.role,input.revision]));
-      let manager:SessionManager|undefined,tree:Worktree|null=null;
+      let manager:SessionManager|undefined,tree:Worktree|null=null,mcpFollower:MCPToolFollower|undefined;
       const fork=input.workspace.kind==='fork'?input.workspace.sessionFile:null;
       try {
         const parent=main();
@@ -151,31 +153,66 @@ export function createHostPort(options:HostOptions):HostPort {
               return {content:[{type:'text',text:JSON.stringify(response)}],details:response,isError:!response.ok};
             },
         };
-        const tools=savedContract?.success?savedContract.data.tools:[...new Set([...(agent.tools??parent.getEnabledToolNames()).filter(name=>!['roundtable','task','fork_task','todo','ask','schedule'].includes(name)),'roundtable'])];
-        const override=cfgTaskAgentModelOverrides.get(parent.settings)[input.agent];
+        // A seat is a full native session: Main's prepared extensions and extension roots, the workspace's settings,
+        // custom tools and MCP, and delegation per its agent definition. Only the bound roundtable tool is added.
+        const settings=(await parent.settings.cloneForCwd(workspace)).overlay({
+          // Seats run headless: the ticket launch is the authorization boundary and no UI can answer approvals.
+          'tools.approvalMode':'yolo',
+          // A seat's work is one long turn; post-turn compaction would only run after it ends.
+          'compaction.midTurnEnabled':true,
+        });
+        const spawns=agent.spawns===undefined||agent.spawns==='*'?'*':agent.spawns.join(',');
+        const agentTools=agent.tools&&[...new Set([...agent.tools,'task','wait','roundtable'])];
+        const override=cfgTaskAgentModelOverrides.get(settings)[input.agent];
         const modelPattern=parent.model?`${parent.model.provider}/${parent.model.id}`:undefined;
-        const modelSelection=resolveAgentModelSelection({settings:parent.settings,
+        const modelSelection=resolveAgentModelSelection({settings,
           ...(override!==undefined?{settingsOverride:override}:{}),
           ...(agent.model!==undefined?{agentModel:agent.model}:{}),
           ...(modelPattern!==undefined?{activeModelPattern:modelPattern,fallbackModelPattern:modelPattern}:{}),
         });
         const cacheKey=manager.getHeader()?.providerPromptCacheKey??manager.getHeader()?.id;
+        // Main's MCP manager is shared like a native subagent's; its tools follow reloads through proxies.
+        const mcpManager=MCPManager.instance();
+        mcpFollower=mcpManager?followMCPTools(mcpManager,new Set(['roundtable'])):undefined;
+        const mcpTools=mcpManager?createMCPProxyTools(mcpManager).filter(proxy=>proxy.name!=='roundtable'):[];
         const created=await createAgentSession({cwd:workspace,sessionManager:manager,authStorage:parent.modelRegistry.authStorage,modelRegistry:parent.modelRegistry,
-          credentialSourceSessionId:parent.sessionManager.getSessionId(),settings:createSubagentSettings(parent.settings),
+          credentialSourceSessionId:parent.sessionManager.getSessionId(),settings,
           ...(!fork&&modelSelection.patterns?{modelPattern:modelSelection.patterns}:{}),
           ...(fork&&cacheKey?{providerPromptCacheKey:cacheKey,providerPromptCacheKeySource:'fork' as const}:{}),
-          ...(savedContract.success?{systemPrompt:savedContract.data.systemPrompt}:{appendSystemPrompt:agent.systemPrompt}),
-          customTools:[tool],disableExtensionDiscovery:true,toolNames:tools,restrictToolNames:true,allowRestrictedCustomTools:true,
-          hasUI:false,bindProcessState:false,cacheWarming:false,enableIrc:false,enableMCP:false,
+          ...(savedContract.success
+            ?{systemPrompt:savedContract.data.systemPrompt,toolNames:savedContract.data.tools,mountedToolNames:savedContract.data.mountedTools}
+            :{appendSystemPrompt:agent.systemPrompt,...(agentTools?{toolNames:agentTools}:{})}),
+          // The SDK registers custom tools after extension tools, so this bound tool replaces the inactive
+          // roundtable tool the extension itself registers inside the seat.
+          customTools:[tool],enableMCP:true,
+          ...(mcpManager?{mcpManager,...(mcpTools.length?{mcpTools}:{})}:{}),
+          // An empty list would bind no extensions and prune Main's extension-provided model sources.
+          ...(parent.preparedExtensions?.length?{preloadedPreparedExtensions:parent.preparedExtensions}:{}),
+          ...(parent.extensionPaths?.length?{preloadedExtensionPaths:[...parent.extensionPaths]}:{}),
+          extensionRoots:()=>parent.effectiveExtensionRoots,
+          // A seat reports to Main only through its ticket, never as an IRC peer.
+          hasUI:false,bindProcessState:false,cacheWarming:false,enableIrc:false,
           agentId:id,agentName:agent.name,agentDisplayName:`${input.role}: ${input.ticketId}`,parentAgentId:MAIN_AGENT_ID,parentTaskPrefix:id,taskDepth:1,expectedAgentRef:null,
-          spawns:'',inheritedSessionAgents:parent.getSessionAgents(),
+          spawns,inheritedSessionAgents:parent.getSessionAgents(),
         });
         seat.session=created.session;
-        if(!fork){
-          manager.appendCustomEntry('roundtable-session-contract',{systemPrompt:created.session.systemPrompt,tools});
-          manager.appendSessionInit({systemPrompt:created.session.systemPrompt.join('\n\n'),task:input.prompt,tools,agent:agent.name,readOnly:input.role!=='owner',spawns:''});
+        mcpFollower?.bind(created.session);
+        const extensionSends:Promise<unknown>[]=[];
+        await initializeExtensions(created.session,{reportSendError:(_action,error)=>options.onSeatError(input.ticketId,error.message),reportRuntimeError:error=>options.onSeatError(input.ticketId,error.error),
+          trackExtensionSend:send=>{extensionSends.push(send.catch(()=>{}));}});
+        while(extensionSends.length)await Promise.all(extensionSends.splice(0));
+        // Extensions settle the active set on session_start (omp-unified-exec replaces bash with exec_command).
+        const tools=created.session.getEnabledToolNames();
+        if(!tools.includes('roundtable'))throw new Error('Seat session did not enable its roundtable tool');
+        if(fork){
+          // Like a native fork, the rework seat must not inherit its predecessor's finished todo list.
+          created.session.setTodoPhases([]);
+          manager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE,{phases:[]});
+        }else{
+          // The base prompt (before any per-turn extension rewrite) and tool presentation a rework fork restores for an identical prefix.
+          manager.appendCustomEntry('roundtable-session-contract',{systemPrompt:created.session.systemPrompt,tools,mountedTools:created.session.getMountedXdevToolNames()});
+          manager.appendSessionInit({systemPrompt:created.session.systemPrompt,task:input.prompt,tools,agent:agent.name,readOnly:input.role!=='owner',spawns});
         }
-        await initializeExtensions(created.session,{reportSendError:(_action,error)=>options.onSeatError(input.ticketId,error.message),reportRuntimeError:error=>options.onSeatError(input.ticketId,error.error)});
         const prompt=fork&&handoff?.success
           ? `Continue ticket ${input.ticketId} at revision ${input.revision}. Only the incremental handoff follows. Call roundtable read if the current contract or PR is needed.\n${JSON.stringify({notes:input.ticket.notes.slice(handoff.data.notes),rulings:input.ticket.rulings.slice(handoff.data.rulings)})}`
           : input.prompt;
@@ -224,7 +261,7 @@ export function createHostPort(options:HostOptions):HostPort {
         return {ok:true,value:{agentId:id,sessionFile,jobId}};
       }catch(error){
         seats.delete(id);
-        if(seat.session)await seat.session.dispose();else if(manager)await manager.close();
+        if(seat.session)await seat.session.dispose();else {mcpFollower?.dispose();if(manager)await manager.close();}
         let detail=error instanceof Error?error.message:String(error);
         if(tree){const created=tree;try {await locked(created.bare,()=>git(['-C',created.bare,'worktree','remove','--force',created.path]));}catch(cause){detail+=`; worktree cleanup failed: ${cause instanceof Error?cause.message:String(cause)}`;}}
         return {ok:false,error:{kind:'unavailable',message:detail}};
