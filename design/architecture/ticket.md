@@ -81,69 +81,76 @@ operations
   -- 召集新议程并写入初始票据图
   Convene(initial: map TicketId to TicketRecord)
   ext wr tickets
-  pre tickets = {|->}
-      and forall id in set dom initial & initial(id).dependsOn subset (dom initial \ {id})
-  post tickets = initial;
+  pre forall id in set dom initial & initial(id).dependsOn subset (dom initial \ {id})
+  post if tickets~ = {|->}
+       then tickets = initial
+       else tickets = tickets~;
 
   -- 主协调器将一张可派发票据放上桌面；每张票据至多放上桌面一次
   Launch(id: TicketId)
   ext wr tickets
-  pre Launchable(tickets, id)
-  post tickets = tickets~ ++ {id |-> mu(tickets~(id), started |-> true)};
+  post if Launchable(tickets~, id)
+       then tickets = tickets~ ++ {id |-> mu(tickets~(id), started |-> true)}
+       else tickets = tickets~;
 
   -- 记下票据在当前源码指纹下通过的一道必需门禁
   PassGate(id: TicketId, gate: Gate, stamp: Stamp)
   ext wr tickets
-  pre id in set dom tickets
-      and tickets(id).started
-      and tickets(id).status = <Open>
-      and tickets(id).stamp = stamp
-      and gate in set tickets(id).required
-  post let prev = tickets~(id) in
-       tickets = tickets~ ++ {id |-> mu(prev, passed |-> prev.passed union {gate})};
+  post if id in set dom tickets~
+          and tickets~(id).started
+          and tickets~(id).status = <Open>
+          and tickets~(id).stamp = stamp
+          and gate in set tickets~(id).required
+       then let prev = tickets~(id) in
+            tickets = tickets~ ++ {id |-> mu(prev, passed |-> prev.passed union {gate})}
+       else tickets = tickets~;
 
   -- 远端源码指纹变更时更新指纹、递增修订号并清空旧指纹下的门禁通过记录
   RefreshStamp(id: TicketId, stamp: Stamp)
   ext wr tickets
-  pre id in set dom tickets
-      and tickets(id).status = <Open>
-      and tickets(id).stamp <> stamp
-  post let prev = tickets~(id) in
-       tickets = tickets~ ++ {id |-> mu(prev,
-         revision |-> prev.revision + 1,
-         stamp |-> stamp,
-         passed |-> {})};
+  post if id in set dom tickets~
+          and tickets~(id).status = <Open>
+          and tickets~(id).stamp <> stamp
+       then let prev = tickets~(id) in
+            tickets = tickets~ ++ {id |-> mu(prev,
+              revision |-> prev.revision + 1,
+              stamp |-> stamp,
+              passed |-> {})}
+       else tickets = tickets~;
 
   -- 门禁拒绝、席位无交接退出、外部写入失败或契约冲突时，递增修订号、清空门禁并转入升级状态
   Escalate(id: TicketId)
   ext wr tickets
-  pre id in set dom tickets and tickets(id).status <> <Done>
-  post let prev = tickets~(id) in
-       tickets = tickets~ ++ {id |-> mu(prev,
-         revision |-> prev.revision + 1,
-         passed |-> {},
-         status |-> <Escalated>)};
+  post if id in set dom tickets~ and tickets~(id).status <> <Done>
+       then let prev = tickets~(id) in
+            tickets = tickets~ ++ {id |-> mu(prev,
+              revision |-> prev.revision + 1,
+              passed |-> {},
+              status |-> <Escalated>)}
+       else tickets = tickets~;
 
   -- 主协调器裁定升级票据：递增修订号、绑定新源码指纹与必需门禁集合并重新打开票据
   Resolve(id: TicketId, stamp: Stamp, required: set of Gate)
   ext wr tickets
-  pre id in set dom tickets and tickets(id).status = <Escalated>
-  post let prev = tickets~(id) in
-       tickets = tickets~ ++ {id |-> mu(prev,
-         revision |-> prev.revision + 1,
-         stamp |-> stamp,
-         required |-> required,
-         passed |-> {},
-         status |-> <Open>)};
+  post if id in set dom tickets~ and tickets~(id).status = <Escalated>
+       then let prev = tickets~(id) in
+            tickets = tickets~ ++ {id |-> mu(prev,
+              revision |-> prev.revision + 1,
+              stamp |-> stamp,
+              required |-> required,
+              passed |-> {},
+              status |-> <Open>)}
+       else tickets = tickets~;
 
   -- 前置依赖全部完成且当前指纹下的必需门禁全部通过后，确认票据完成
   Complete(id: TicketId)
   ext wr tickets
-  pre id in set dom tickets
-      and tickets(id).started
-      and tickets(id).status = <Open>
-      and DependenciesDone(tickets, tickets(id))
-      and tickets(id).passed = tickets(id).required
-  post tickets = tickets~ ++ {id |-> mu(tickets~(id), status |-> <Done>)};
+  post if id in set dom tickets~
+          and tickets~(id).started
+          and tickets~(id).status = <Open>
+          and DependenciesDone(tickets~, tickets~(id))
+          and tickets~(id).passed = tickets~(id).required
+       then tickets = tickets~ ++ {id |-> mu(tickets~(id), status |-> <Done>)}
+       else tickets = tickets~;
 end Ticket
 ```

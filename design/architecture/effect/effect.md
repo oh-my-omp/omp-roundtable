@@ -79,50 +79,55 @@ operations
   -- 为没有在途活动意图的票据登记一条就绪的外部写入意图
   Enqueue(id: EffectId, ticket: TicketId, action: Action)
   ext wr byId
-  pre id not in set dom byId
-      and ActiveForTicket(byId, ticket) = {}
-  post byId = byId~ ++ {id |-> mk_Intent(ticket, action, <Ready>)};
+  post if id not in set dom byId~ and ActiveForTicket(byId~, ticket) = {}
+       then byId = byId~ ++ {id |-> mk_Intent(ticket, action, <Ready>)}
+       else byId = byId~;
 
   -- 调用外部接口前先将就绪意图持久化为执行中
   BeginExecute(id: EffectId)
   ext wr byId
-  pre id in set dom byId and byId(id).status = <Ready>
-  post byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Executing>)};
+  post if id in set dom byId~ and byId~(id).status = <Ready>
+       then byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Executing>)}
+       else byId = byId~;
 
   -- 源码读取确认目标事实已成立后，将意图标记为已确认
   Confirm(id: EffectId)
   ext wr byId
-  pre id in set dom byId
-      and byId(id).status in set {<Ready>, <Executing>, <Uncertain>}
-  post byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Confirmed>)};
+  post if id in set dom byId~
+          and byId~(id).status in set {<Ready>, <Executing>, <Uncertain>}
+       then byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Confirmed>)}
+       else byId = byId~;
 
   -- 外部调用未获源码确认时，按失败性质标记为结果未知或已知失败
   Fail(id: EffectId, uncertain: bool)
   ext wr byId
-  pre id in set dom byId
-      and byId(id).status in set {<Ready>, <Executing>}
-  post byId = byId~ ++ {id |-> mu(byId~(id),
-         status |-> if uncertain then <Uncertain> else <Failed>)};
+  post if id in set dom byId~
+          and byId~(id).status in set {<Ready>, <Executing>}
+       then byId = byId~ ++ {id |-> mu(byId~(id),
+              status |-> if uncertain then <Uncertain> else <Failed>)}
+       else byId = byId~;
 
   -- 协调器重启接管议程时，将遗留的执行中意图转为结果未知
   RecoverExecuting(id: EffectId)
   ext wr byId
-  pre id in set dom byId and byId(id).status = <Executing>
-  post byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Uncertain>)};
+  post if id in set dom byId~ and byId~(id).status = <Executing>
+       then byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Uncertain>)}
+       else byId = byId~;
 
   -- 主协调器显式处置失败或结果未知的意图：取消、采纳已确认事实，或在无其他活动意图时重新排入就绪
   Dispose(id: EffectId, disposition: Disposition)
   ext wr byId
-  pre id in set dom byId
-      and byId(id).status in set {<Failed>, <Uncertain>}
-      and (disposition = <Retry> => ActiveForTicket(byId, byId(id).ticket) = {})
-  post let prev = byId~(id) in
-       let nextStatus =
-         cases disposition:
-           <Cancel> -> <Cancelled>,
-           <Adopt> -> <Confirmed>,
-           <Retry> -> <Ready>
-         end in
-       byId = byId~ ++ {id |-> mu(prev, status |-> nextStatus)};
+  post if id in set dom byId~
+          and byId~(id).status in set {<Failed>, <Uncertain>}
+          and (disposition = <Retry> => ActiveForTicket(byId~, byId~(id).ticket) = {})
+       then let prev = byId~(id) in
+            let nextStatus =
+              cases disposition:
+                <Cancel> -> <Cancelled>,
+                <Adopt> -> <Confirmed>,
+                <Retry> -> <Ready>
+              end in
+            byId = byId~ ++ {id |-> mu(prev, status |-> nextStatus)}
+       else byId = byId~;
 end Effect
 ```

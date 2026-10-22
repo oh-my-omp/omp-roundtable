@@ -11,12 +11,12 @@ exports
   types
     SessionFile;
     struct GateSeat; struct Role; struct SeatKey; struct SeatSlot;
-    struct Workspace; struct ExitOutcome
+    struct Workspace; struct StartOutcome; struct ExitOutcome
   functions
     CanSeat: set of SeatSlot * map SeatKey to Revision * SeatSlot -> bool;
     SelectWorkspace: map TicketId to SessionFile * TicketId * Role -> Workspace
   operations
-    Start: SeatSlot ==> Workspace;
+    Start: SeatSlot ==> StartOutcome;
     RecordOwnerHandoff: TicketId * SessionFile ==> ();
     Exit: SeatSlot * bool * Revision ==> ExitOutcome
 definitions
@@ -44,6 +44,9 @@ types
 
   -- 席位工作空间方式：分叉既有编写者会话与工作树，或建立全新检出与空白会话
   Workspace = <Fork> | <Fresh>;
+
+  -- 启动席位的结局：分配工作空间，或因已派发过该修订号或存在互斥活动席位而拒绝
+  StartOutcome = Workspace | <Refused>;
 
   -- 席位退出时的宿主可观察结局：已完成交接、已被新修订号取代、或未交接且修订号仍为当前修订号
   ExitOutcome = <HandedOff> | <Superseded> | <Abandon>;
@@ -80,25 +83,27 @@ functions
     else <Fresh>;
 
 operations
-  -- 启动一个到期的单次席位，登记派发历史与活动表并返回其工作空间方式
-  Start(slot: SeatSlot) w: Workspace
+  -- 启动一个到期的单次席位：符合准入时登记派发历史与活动表并返回工作空间方式，否则保持状态不变并返回拒绝
+  Start(slot: SeatSlot) r: StartOutcome
   ext wr seated wr live rd ownerSessions
-  pre CanSeat(seated, live, slot)
-  post seated = seated~ union {slot}
-       and live = live~ ++ {mk_SeatKey(slot.ticket, slot.role) |-> slot.revision}
-       and w = SelectWorkspace(ownerSessions, slot.ticket, slot.role);
+  post if CanSeat(seated~, live~, slot)
+       then seated = seated~ union {slot}
+            and live = live~ ++ {mk_SeatKey(slot.ticket, slot.role) |-> slot.revision}
+            and r = SelectWorkspace(ownerSessions, slot.ticket, slot.role)
+       else seated = seated~
+            and live = live~
+            and r = <Refused>;
 
   -- 编写者席位完成交接时，保存其原生会话文件供后续返工分叉
   RecordOwnerHandoff(ticket: TicketId, session: SessionFile)
   ext rd seated rd live wr ownerSessions
-  pre mk_SeatKey(ticket, <Owner>) in set dom live
-  post ownerSessions = ownerSessions~ ++ {ticket |-> session};
+  post if mk_SeatKey(ticket, <Owner>) in set dom live
+       then ownerSessions = ownerSessions~ ++ {ticket |-> session}
+       else ownerSessions = ownerSessions~;
 
   -- 席位退出时移出活动表并保留派发历史，返回是否已完成交接、已被新修订号取代或未交接退出
   Exit(slot: SeatSlot, handedOff: bool, currentRevision: Revision) outcome: ExitOutcome
   ext rd seated wr live
-  pre mk_SeatKey(slot.ticket, slot.role) in set dom live
-      and live(mk_SeatKey(slot.ticket, slot.role)) = slot.revision
   post live = {mk_SeatKey(slot.ticket, slot.role)} <-: live~
        and (handedOff => outcome = <HandedOff>)
        and (not handedOff and slot.revision <> currentRevision => outcome = <Superseded>)
