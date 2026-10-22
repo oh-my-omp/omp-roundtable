@@ -8,16 +8,19 @@ imports from Ticket
     Revision renamed Revision
 exports
   types
-    struct Decision
+    struct DecisionKind; struct Decision
   functions
     FreshDecisions: set of Decision * set of Decision -> set of Decision
   operations
-    Observe: set of Decision ==> set of Decision;
-    SettleInTurn: set of Decision * set of Decision ==> set of Decision
+    Observe: set of Decision ==> set of Decision
 definitions
 types
-  -- 一条需主协调器介入的待决决策键：绑定可选票据身份与修订号，使同一票据在新修订号下升级时作为新决策唤醒
+  -- 需主协调器介入的三类决策类别：票据可放上桌面、票据处于升级待裁定、议程全部完成可收尾
+  DecisionKind = <Launch> | <Escalated> | <Finish>;
+
+  -- 一条需主协调器介入的待决决策键：绑定决策类别、可选票据身份与修订号
   Decision ::
+    kind : DecisionKind  -- 待决决策类别
     ticket : [TicketId]  -- 关联的票据身份；议程级收尾决策为空
     revision : [Revision];  -- 关联的票据修订号
 
@@ -39,11 +42,5 @@ operations
   ext wr notified
   post fresh = FreshDecisions(current, notified~)
        and notified = current;
-
-  -- 场景：首次观察唤醒新增决策后，再次观察同一未决集合或已消解的子集时不再重复唤醒
-  SettleInTurn: set of Decision * set of Decision ==> set of Decision
-  SettleInTurn(initial, remaining) ==
-    (let - = Observe(initial) in
-       return Observe(remaining));
 end Attention
 ```

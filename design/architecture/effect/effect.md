@@ -13,7 +13,7 @@ exports
     Apply: TicketId ==> ApplyOutcome;
     Reconcile: EffectId ==> ReconcileOutcome;
     Cancel: EffectId ==> ();
-    RecoverEffect: TicketId ==> ()
+    PendingEffects: () ==> map EffectId to TicketId
 definitions
 types
   -- 一次外部写入意图的唯一身份；由提供方造出，使用方不读内部结构
@@ -23,7 +23,7 @@ types
   Applied ::
     effect : EffectId;  -- 本次写入意图的身份
 
-  -- 外部写入结果未知；调用方必须经 Reconcile 对账确认或经 Cancel 取消后才能继续推进该票据
+  -- 外部写入结果未知；调用方必须经 Reconcile 对账确认或由主协调器经 Cancel 取消后才能继续推进该票据
   Uncertain ::
     effect : EffectId;  -- 待对账或取消的写入意图身份
 
@@ -52,16 +52,16 @@ operations
   Apply(ticket: TicketId) r: ApplyOutcome
   ext wr byTicket wr unresolved
   post (is_Applied(r)
-               and r.effect not in set dom byTicket~
-               and byTicket = byTicket~ ++ {r.effect |-> ticket}
-               and unresolved = unresolved~)
-            or (r = <Rejected>
-                  and byTicket = byTicket~
-                  and unresolved = unresolved~)
-            or (is_Uncertain(r)
-                  and r.effect not in set dom byTicket~
-                  and byTicket = byTicket~ ++ {r.effect |-> ticket}
-                  and unresolved = unresolved~ union {r.effect});
+          and r.effect not in set dom byTicket~
+          and byTicket = byTicket~ ++ {r.effect |-> ticket}
+          and unresolved = unresolved~)
+       or (r = <Rejected>
+             and byTicket = byTicket~
+             and unresolved = unresolved~)
+       or (is_Uncertain(r)
+             and r.effect not in set dom byTicket~
+             and byTicket = byTicket~ ++ {r.effect |-> ticket}
+             and unresolved = unresolved~ union {r.effect});
 
   -- 对结果未知的意图核对远端源码事实；若远端已生效则移出未决集合
   Reconcile(effect: EffectId) r: ReconcileOutcome
@@ -77,15 +77,9 @@ operations
   ext wr unresolved
   post unresolved = unresolved~ \ {effect};
 
-  -- 场景：执行外部写入遇到结果未知时，先经源码对账找回，仍未生效则显式取消
-  RecoverEffect: TicketId ==> ()
-  RecoverEffect(ticket) ==
-    cases Apply(ticket):
-      mk_Applied(-) -> skip,
-      <Rejected> -> skip,
-      mk_Uncertain(eff) ->
-        if Reconcile(eff) = <Absent>
-        then Cancel(eff)
-    end;
+  -- 读取当前尚未结清的未决写入意图到所属票据的映射；只读，不改变意图表
+  PendingEffects() m: map EffectId to TicketId
+  ext rd byTicket rd unresolved
+  post m = unresolved <: byTicket;
 end Effect
 ```
