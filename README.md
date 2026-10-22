@@ -16,7 +16,7 @@ A roundtable starts from the issue it delivers, never from a switch inside a ses
 http://127.0.0.1:47591/tern/<owner>/<repo>/issues/<number>?cwd=<absolute local checkout>
 ```
 
-GitHub strips inline `<svg>` from issue bodies, so the link is written as this repository's badge image wrapped in the link, not as a bare URL:
+GitHub strips inline `<svg>` from issue bodies, so the link is written as this repository's badge image wrapped in the link, not as a bare URL. `cwd` is percent-encoded as a query value; an unencoded space would end the Markdown link:
 
 ```markdown
 [![Coordinate with Roundtable](https://raw.githubusercontent.com/oh-my-omp/omp-roundtable/main/docs/badge/coordinate-with-roundtable.svg)](http://127.0.0.1:47591/tern/<owner>/<repo>/issues/<number>?cwd=<absolute local checkout>)
