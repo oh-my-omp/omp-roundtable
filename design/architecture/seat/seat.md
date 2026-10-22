@@ -5,108 +5,90 @@ module Seat
 imports from Ticket
   types
     TicketId renamed TicketId;
-    Gate renamed Gate;
     Revision renamed Revision
 exports
   types
-    SessionFile;
-    struct GateSeat; struct Role; struct SeatKey; struct SeatSlot;
-    struct Workspace; struct StartOutcome; struct ExitOutcome
+    SeatId;
+    struct Role; struct SeatSlot; struct Workspace;
+    struct Seated; struct AcquireOutcome; struct ReleaseOutcome
   functions
-    CanSeat: set of SeatSlot * map SeatKey to Revision * SeatSlot -> bool;
-    SelectWorkspace: map TicketId to SessionFile * TicketId * Role -> Workspace
+    SelectWorkspace: set of TicketId * TicketId * Role -> Workspace
   operations
-    Start: SeatSlot ==> StartOutcome;
-    RecordOwnerHandoff: TicketId * SessionFile ==> ();
-    Exit: SeatSlot * bool * Revision ==> ExitOutcome
+    Acquire: SeatSlot ==> AcquireOutcome;
+    Release: SeatId * bool ==> ReleaseOutcome
 definitions
 types
-  -- 持久化的编写者原生会话记录文件身份；使用方不读内部结构
-  SessionFile = token;
+  -- 一次席位会话的唯一身份；由宿主造出，调用方在 Release 时交回
+  SeatId = token;
 
-  -- 执行单道核验门禁的席位角色
-  GateSeat ::
-    gate : Gate;  -- 所核验的门禁身份
+  -- 席位角色：保留会话与工作树的编写者，或使用全新空白检出的独立门禁
+  Role = <Owner> | <Gate>;
 
-  -- 席位角色：编写者或独立核验门禁
-  Role = <Owner> | GateSeat;
-
-  -- 票据与席位角色的运行槽位键
-  SeatKey ::
-    ticket : TicketId  -- 席位绑定的票据身份
-    role : Role;  -- 席位担任的角色
-
-  -- 绑定特定修订号的单次席位派发记录
+  -- 绑定特定票据、角色与修订号的单次席位派发槽位
   SeatSlot ::
     ticket : TicketId  -- 席位绑定的票据身份
     role : Role  -- 席位担任的角色
-    revision : Revision;  -- 派发时的修订号
+    revision : Revision;  -- 派发时的票据修订号
 
   -- 席位工作空间方式：分叉既有编写者会话与工作树，或建立全新检出与空白会话
   Workspace = <Fork> | <Fresh>;
 
-  -- 启动席位的结局：分配工作空间，或因已派发过该修订号或存在互斥活动席位而拒绝
-  StartOutcome = Workspace | <Refused>;
+  -- 席位已成功启动；调用方之后必须用 Release 结束它
+  Seated ::
+    seat : SeatId  -- 结束席位时交回的身份
+    workspace : Workspace;  -- 本次席位所使用的工作空间方式
 
-  -- 席位退出时的宿主可观察结局：已完成交接、已被新修订号取代、或未交接且修订号仍为当前修订号
-  ExitOutcome = <HandedOff> | <Superseded> | <Abandon>;
+  -- Acquire 的结局：已启动并交出席位身份与工作空间，或因该槽位已派发过/存在活动冲突而被拒绝
+  AcquireOutcome = Seated | <Refused>;
 
-  -- 席位宿主状态：所有活动席位都已记入单次派发历史，同一票据下编写者与门禁互不并发，已记录会话文件的票据必曾派发过编写者
+  -- Release 的结局：已完成交接正常结束，或未交接中途退出（恢复需调用 Ticket`Escalate 升级票据）
+  ReleaseOutcome = <HandedOff> | <Abandoned>;
+
+  -- 席位宿主状态：活动席位均属已登记席位，同一槽位至多派发一次，可分叉票据必曾派发过编写者席位
 state Seats of
-  seated : set of SeatSlot  -- 已派发过的（票据、角色、修订号）集合，只增不减
-  live : map SeatKey to Revision  -- 当前正在运行的席位及其绑定的修订号
-  ownerSessions : map TicketId to SessionFile  -- 已交接的编写者席位留下的会话文件
-  inv mk_Seats(s, l, o) ==
-    (forall k in set dom l & mk_SeatSlot(k.ticket, k.role, l(k)) in set s)
-    and (forall k1, k2 in set dom l &
-           k1 <> k2 and k1.ticket = k2.ticket =>
-             k1.role <> <Owner> and k2.role <> <Owner>)
-    and (forall t in set dom o & exists slot in set s & slot.ticket = t and slot.role = <Owner>)
-  init s == s = mk_Seats({}, {|->}, {|->})
+  bySeat : map SeatId to SeatSlot  -- 席位身份到其派发槽位的映射
+  live : set of SeatId  -- 已启动、尚未结束的席位集合
+  forkable : set of TicketId  -- 已完成过编写者交接、后续返工可分叉会话的票据集合
+  inv mk_Seats(b, l, f) ==
+    l subset dom b
+    and (forall s1, s2 in set dom b & s1 <> s2 => b(s1) <> b(s2))
+    and (forall t in set f & exists slot in set rng b & slot.ticket = t and slot.role = <Owner>)
+  init s == s = mk_Seats({|->}, {}, {})
 end
 
 functions
-  -- 判定一个席位槽位当前是否允许启动：该修订号未曾派发过，且编写者与同票据任何角色互斥、门禁与同角色及编写者互斥
-  CanSeat: set of SeatSlot * map SeatKey to Revision * SeatSlot -> bool
-  CanSeat(history, active, slot) ==
-    slot not in set history
-    and (if slot.role = <Owner>
-         then not exists k in set dom active & k.ticket = slot.ticket
-         else mk_SeatKey(slot.ticket, slot.role) not in set dom active
-              and mk_SeatKey(slot.ticket, <Owner>) not in set dom active);
-
-  -- 计算席位应使用的工作空间：已有会话记录的返工编写者分叉原会话，首次编写者与所有门禁席位均使用全新检出
-  SelectWorkspace: map TicketId to SessionFile * TicketId * Role -> Workspace
-  SelectWorkspace(sessions, ticket, role) ==
-    if role = <Owner> and ticket in set dom sessions
+  -- 计算席位应使用的工作空间：已有编写者交接记录的返工编写者分叉原会话，其余情形均使用全新检出
+  SelectWorkspace: set of TicketId * TicketId * Role -> Workspace
+  SelectWorkspace(forkedTickets, ticket, role) ==
+    if role = <Owner> and ticket in set forkedTickets
     then <Fork>
     else <Fresh>;
 
 operations
-  -- 启动一个到期的单次席位：符合准入时登记派发历史与活动表并返回工作空间方式，否则保持状态不变并返回拒绝
-  Start(slot: SeatSlot) r: StartOutcome
-  ext wr seated wr live rd ownerSessions
-  post if CanSeat(seated~, live~, slot)
-       then seated = seated~ union {slot}
-            and live = live~ ++ {mk_SeatKey(slot.ticket, slot.role) |-> slot.revision}
-            and r = SelectWorkspace(ownerSessions, slot.ticket, slot.role)
-       else seated = seated~
-            and live = live~
-            and r = <Refused>;
+  -- 为未曾派发过的槽位启动单次席位；每个（票据、角色、修订号）槽位至多成功启动一次
+  Acquire(slot: SeatSlot) r: AcquireOutcome
+  ext wr bySeat wr live rd forkable
+  post (slot not in set rng bySeat~
+          and is_Seated(r)
+          and r.seat not in set dom bySeat~
+          and r.workspace = SelectWorkspace(forkable, slot.ticket, slot.role)
+          and bySeat = bySeat~ ++ {r.seat |-> slot}
+          and live = live~ union {r.seat})
+       or (r = <Refused>
+             and bySeat = bySeat~
+             and live = live~);
 
-  -- 编写者席位完成交接时，保存其原生会话文件供后续返工分叉
-  RecordOwnerHandoff(ticket: TicketId, session: SessionFile)
-  ext rd seated rd live wr ownerSessions
-  post if mk_SeatKey(ticket, <Owner>) in set dom live
-       then ownerSessions = ownerSessions~ ++ {ticket |-> session}
-       else ownerSessions = ownerSessions~;
-
-  -- 席位退出时移出活动表并保留派发历史，返回是否已完成交接、已被新修订号取代或未交接退出
-  Exit(slot: SeatSlot, handedOff: bool, currentRevision: Revision) outcome: ExitOutcome
-  ext rd seated wr live
-  post live = {mk_SeatKey(slot.ticket, slot.role)} <-: live~
-       and (handedOff => outcome = <HandedOff>)
-       and (not handedOff and slot.revision <> currentRevision => outcome = <Superseded>)
-       and (not handedOff and slot.revision = currentRevision => outcome = <Abandon>);
+  -- 结束一次席位运行；编写者完成交接时记录该票据可分叉，未交接退出时返回 Abandoned
+  Release(seat: SeatId, handedOff: bool) r: ReleaseOutcome
+  ext rd bySeat wr live wr forkable
+  post live = live~ \ {seat}
+       and (if handedOff
+            then r = <HandedOff>
+                 and forkable =
+                   (if seat in set dom bySeat and bySeat(seat).role = <Owner>
+                    then forkable~ union {bySeat(seat).ticket}
+                    else forkable~)
+            else r = <Abandoned>
+                 and forkable = forkable~);
 end Seat
 ```
