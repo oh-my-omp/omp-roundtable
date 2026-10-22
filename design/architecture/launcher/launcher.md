@@ -7,13 +7,14 @@ exports
   types
     BlockId;
     struct Frontend; struct Navigation; struct Block;
-    struct TernSnapshot; struct LaunchOutcome
+    struct TernSnapshot; struct TernProbe; struct LaunchOutcome
   values
     LauncherPort : nat1
   functions
     AuthorizedNavigation: Navigation -> bool;
+    RequiresWindowOpen: Navigation * TernProbe -> bool;
     LiveCoordinatorBlocks: set of Block * IssueRef -> set of BlockId;
-    DecideLaunch: Navigation * TernSnapshot * bool -> LaunchOutcome
+    DecideLaunch: Navigation * TernProbe -> LaunchOutcome
 definitions
 values
   -- 已发布议题徽章链接固定的本地回环监听端口
@@ -42,10 +43,13 @@ types
     live : bool  -- 命令块是否处于活动列出状态
     exited : bool;  -- 命令块进程是否已退出
 
-  -- 终端前端的窗口连接与命令块快照
+  -- 终端前端在探测成功时的窗口连接与命令块快照
   TernSnapshot ::
     windowConnected : bool  -- 是否有可见的窗口客户端连接到守护进程
     blocks : set of Block;  -- 当前列出的全部命令块
+
+  -- 终端前端探测结果：成功返回快照或前端命令执行失败
+  TernProbe = TernSnapshot | <FrontendUnreachable>;
 
   -- 单次启动请求的四种可观察结局
   LaunchOutcome = <Launched> | <Focused> | <Rejected> | <FrontendFailed>;
@@ -60,20 +64,34 @@ functions
     and nav.frontend = <Tern>
     and nav.cwdExists;
 
+  -- 判定在聚焦或启动协调器标签页前是否必须先在目标目录拉起可见的终端窗口
+  RequiresWindowOpen: Navigation * TernProbe -> bool
+  RequiresWindowOpen(nav, probe) ==
+    AuthorizedNavigation(nav)
+    and cases probe:
+          mk_TernSnapshot(w, -) -> not w,
+          others -> true
+        end;
+
   -- 筛选终端中已绑定同一议题且进程尚未退出的活动协调器块
   LiveCoordinatorBlocks: set of Block * IssueRef -> set of BlockId
   LiveCoordinatorBlocks(blocks, issue) ==
     {b.id | b in set blocks & b.issue = issue and b.live and not b.exited};
 
-  -- 判定一次链接请求的最终结局：拒绝非法请求、报告前端失败、聚焦已有活动块或启动新标签页
-  DecideLaunch: Navigation * TernSnapshot * bool -> LaunchOutcome
-  DecideLaunch(nav, tern, frontendOk) ==
+  -- 判定一次链接请求在窗口就绪检查后的最终结局：拒绝非法请求、无可见窗口或前端不可达时报告前端失败、聚焦已有活动块或启动新标签页
+  DecideLaunch: Navigation * TernProbe -> LaunchOutcome
+  DecideLaunch(nav, probe) ==
     if not AuthorizedNavigation(nav)
     then <Rejected>
-    elseif not frontendOk
-    then <FrontendFailed>
-    elseif LiveCoordinatorBlocks(tern.blocks, nav.issue) <> {}
-    then <Focused>
-    else <Launched>;
+    else
+      cases probe:
+        mk_TernSnapshot(w, blocks) ->
+          if not w
+          then <FrontendFailed>
+          elseif LiveCoordinatorBlocks(blocks, nav.issue) <> {}
+          then <Focused>
+          else <Launched>,
+        others -> <FrontendFailed>
+      end;
 end Launcher
 ```
