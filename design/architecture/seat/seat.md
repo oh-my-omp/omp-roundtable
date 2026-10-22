@@ -5,12 +5,13 @@ module Seat
 imports from Ticket
   types
     TicketId renamed TicketId;
-    Role renamed Role;
+    Gate renamed Gate;
     Revision renamed Revision
 exports
   types
     SessionFile;
-    struct SeatKey; struct SeatSlot; struct Workspace; struct ExitOutcome
+    struct GateSeat; struct Role; struct SeatKey; struct SeatSlot;
+    struct Workspace; struct ExitOutcome
   functions
     CanSeat: set of SeatSlot * map SeatKey to Revision * SeatSlot -> bool;
     SelectWorkspace: map TicketId to SessionFile * TicketId * Role -> Workspace
@@ -23,19 +24,26 @@ types
   -- 持久化的编写者原生会话记录文件身份；使用方不读内部结构
   SessionFile = token;
 
-  -- 票据或收尾门禁与席位角色的运行槽位键
+  -- 执行单道核验门禁的席位角色
+  GateSeat ::
+    gate : Gate;  -- 所核验的门禁身份
+
+  -- 席位角色：编写者或独立核验门禁
+  Role = <Owner> | GateSeat;
+
+  -- 票据与席位角色的运行槽位键
   SeatKey ::
-    ticket : TicketId  -- 席位绑定的票据或父议题收尾门禁身份
+    ticket : TicketId  -- 席位绑定的票据身份
     role : Role;  -- 席位担任的角色
 
   -- 绑定特定修订号的单次席位派发记录
   SeatSlot ::
-    ticket : TicketId  -- 席位绑定的票据或父议题收尾门禁身份
+    ticket : TicketId  -- 席位绑定的票据身份
     role : Role  -- 席位担任的角色
     revision : Revision;  -- 派发时的修订号
 
-  -- 席位工作空间方式：分叉既有编写者会话、检出目标分支基线、或检出门禁印记指定的精确提交
-  Workspace = <Fork> | <Base> | <Commit>;
+  -- 席位工作空间方式：分叉既有编写者会话与工作树，或建立全新检出与空白会话
+  Workspace = <Fork> | <Fresh>;
 
   -- 席位退出时的宿主可观察结局：已完成交接、已被新修订号取代、或未交接且修订号仍为当前修订号
   ExitOutcome = <HandedOff> | <Superseded> | <Abandon>;
@@ -64,17 +72,15 @@ functions
          else mk_SeatKey(slot.ticket, slot.role) not in set dom active
               and mk_SeatKey(slot.ticket, <Owner>) not in set dom active);
 
-  -- 计算席位应使用的工作空间：已有会话记录的返工编写者分叉原会话，首次编写者与收尾门禁检出目标基线，其余门禁检出精确提交
+  -- 计算席位应使用的工作空间：已有会话记录的返工编写者分叉原会话，首次编写者与所有门禁席位均使用全新检出
   SelectWorkspace: map TicketId to SessionFile * TicketId * Role -> Workspace
   SelectWorkspace(sessions, ticket, role) ==
-    cases role:
-      <Owner> -> if ticket in set dom sessions then <Fork> else <Base>,
-      <Closure> -> <Base>,
-      others -> <Commit>
-    end;
+    if role = <Owner> and ticket in set dom sessions
+    then <Fork>
+    else <Fresh>;
 
 operations
-  -- 启动一个到期的单次席位，登记派发历史与活动表并返回其工作空间类型
+  -- 启动一个到期的单次席位，登记派发历史与活动表并返回其工作空间方式
   Start(slot: SeatSlot) w: Workspace
   ext wr seated wr live rd ownerSessions
   pre CanSeat(seated, live, slot)
@@ -82,7 +88,7 @@ operations
        and live = live~ ++ {mk_SeatKey(slot.ticket, slot.role) |-> slot.revision}
        and w = SelectWorkspace(ownerSessions, slot.ticket, slot.role);
 
-  -- 编写者席位完成提交或升级交接时，保存其原生会话文件供后续返工分叉
+  -- 编写者席位完成交接时，保存其原生会话文件供后续返工分叉
   RecordOwnerHandoff(ticket: TicketId, session: SessionFile)
   ext rd seated rd live wr ownerSessions
   pre mk_SeatKey(ticket, <Owner>) in set dom live

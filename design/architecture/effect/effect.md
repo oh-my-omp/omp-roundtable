@@ -5,27 +5,26 @@ module Effect
 imports from Ticket types TicketId renamed TicketId
 exports
   types
-    EffectId;
-    struct ActionKind; struct EffectStatus; struct Disposition; struct Intent
+    EffectId; Action;
+    struct EffectStatus; struct Disposition; struct Intent
   functions
     ActiveForTicket: map EffectId to Intent * TicketId -> set of EffectId;
     Unsettled: map EffectId to Intent * TicketId -> set of EffectId;
     AllSettled: map EffectId to Intent -> bool
   operations
-    Enqueue: EffectId * TicketId * ActionKind ==> ();
+    Enqueue: EffectId * TicketId * Action ==> ();
     BeginExecute: EffectId ==> ();
     Confirm: EffectId ==> ();
     Fail: EffectId * bool ==> ();
     RecoverExecuting: EffectId ==> ();
-    CancelReady: EffectId ==> ();
     Dispose: EffectId * Disposition ==> ()
 definitions
 types
   -- 一次外部写入意图的唯一身份；使用方不读内部结构
   EffectId = token;
 
-  -- 状态机向 GitHub 发起的受控外部写入动作类别
-  ActionKind = <PublishPr> | <MergePr> | <SetIssueState> | <ReplaceBody> | <CreateIssue> | <AttachChild> | <RerunChecks>;
+  -- 待执行的外部写入动作；具体业务载荷对本模块隐藏
+  Action = token;
 
   -- 外部写入意图的持久生命周期状态
   EffectStatus = <Ready> | <Executing> | <Confirmed> | <Failed> | <Uncertain> | <Cancelled>;
@@ -35,11 +34,11 @@ types
 
   -- 一条外部写入意图的记录
   Intent ::
-    ticket : TicketId  -- 该写入意图归属的票据或父议题收尾门禁身份
-    action : ActionKind  -- 待执行的外部写入动作
+    ticket : TicketId  -- 该写入意图归属的票据身份
+    action : Action  -- 待执行的外部写入动作
     status : EffectStatus;  -- 当前持久化的意图状态
 
-  -- 外部写入意图表：同一票据或收尾门禁在同一时刻至多有一条就绪或执行中的活动写入意图
+  -- 外部写入意图表：同一票据在同一时刻至多有一条就绪或执行中的活动写入意图
 state Effects of
   byId : map EffectId to Intent  -- 意图身份到意图记录的映射
   inv mk_Effects(b) ==
@@ -54,7 +53,7 @@ state Effects of
 end
 
 functions
-  -- 计算指定票据或收尾门禁当前处于就绪或执行中的活动写入意图集合
+  -- 计算指定票据当前处于就绪或执行中的活动写入意图集合
   ActiveForTicket: map EffectId to Intent * TicketId -> set of EffectId
   ActiveForTicket(table, ticket) ==
     {id | id in set dom table &
@@ -62,7 +61,7 @@ functions
        intent.ticket = ticket
        and intent.status in set {<Ready>, <Executing>}};
 
-  -- 计算指定票据或收尾门禁下尚未结清（非已确认且非已取消）的意图集合；重新放开工作或移除票据前必须为空
+  -- 计算指定票据下尚未结清（非已确认且非已取消）的意图集合
   Unsettled: map EffectId to Intent * TicketId -> set of EffectId
   Unsettled(table, ticket) ==
     {id | id in set dom table &
@@ -70,15 +69,15 @@ functions
        intent.ticket = ticket
        and intent.status not in set {<Confirmed>, <Cancelled>}};
 
-  -- 判定全部外部写入意图是否均已确认或已取消；议程收尾前必须满足
+  -- 判定全部外部写入意图是否均已确认或已取消
   AllSettled: map EffectId to Intent -> bool
   AllSettled(table) ==
     forall intent in set rng table &
       intent.status in set {<Confirmed>, <Cancelled>};
 
 operations
-  -- 为没有在途活动意图的票据或收尾门禁登记一条就绪的外部写入意图
-  Enqueue(id: EffectId, ticket: TicketId, action: ActionKind)
+  -- 为没有在途活动意图的票据登记一条就绪的外部写入意图
+  Enqueue(id: EffectId, ticket: TicketId, action: Action)
   ext wr byId
   pre id not in set dom byId
       and ActiveForTicket(byId, ticket) = {}
@@ -105,19 +104,13 @@ operations
   post byId = byId~ ++ {id |-> mu(byId~(id),
          status |-> if uncertain then <Uncertain> else <Failed>)};
 
-  -- 协调器重启接管议程时，将遗留的执行中意图转为结果未知，绝不自动重放外部写入
+  -- 协调器重启接管议程时，将遗留的执行中意图转为结果未知
   RecoverExecuting(id: EffectId)
   ext wr byId
   pre id in set dom byId and byId(id).status = <Executing>
   post byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Uncertain>)};
 
-  -- 票据阶段不再授权尚未发出的就绪意图时将其取消
-  CancelReady(id: EffectId)
-  ext wr byId
-  pre id in set dom byId and byId(id).status = <Ready>
-  post byId = byId~ ++ {id |-> mu(byId~(id), status |-> <Cancelled>)};
-
-  -- 主协调器显式处置失败或结果未知的意图：取消、采纳已获源码确认的事实，或在无其他活动意图时重新排入就绪
+  -- 主协调器显式处置失败或结果未知的意图：取消、采纳已确认事实，或在无其他活动意图时重新排入就绪
   Dispose(id: EffectId, disposition: Disposition)
   ext wr byId
   pre id in set dom byId
