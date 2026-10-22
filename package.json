@@ -1,6 +1,6 @@
 {
   "name": "omp-roundtable",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Roundtable delivery for Oh My Pi with durable local protocol state, isolated seats, source-confirmed effects, and native scheduling.",
   "type": "module",
   "license": "MIT",
