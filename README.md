@@ -4,7 +4,7 @@ Roundtable delivers GitHub issue graphs through durable tickets, source-confirme
 
 ## Demo
 
-[![Watch the omp-roundtable walkthrough](https://raw.githubusercontent.com/oh-my-omp/omp-roundtable/main/docs/demo/roundtable-parallel-poster.png)](https://cdn.jsdelivr.net/gh/oh-my-omp/omp-roundtable@main/docs/demo/roundtable-parallel.mp4)
+[![Watch the omp-roundtable walkthrough](https://raw.githubusercontent.com/oh-my-omp/omp-roundtable/730a36c0fdc194f65652f4ad4edbfdea99077af0/docs/demo/roundtable-parallel-poster.png)](https://cdn.jsdelivr.net/gh/oh-my-omp/omp-roundtable@730a36c0fdc194f65652f4ad4edbfdea99077af0/docs/demo/roundtable-parallel.mp4)
 
 A 3-minute walkthrough of a real run of `omp --roundtable RiriAgent/rt-e2e-20260930-0931#178`, every model on `openai-codex/gpt-6.1-sol`. The parent has four sub-issues: [#174](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/174) and [#175](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/175) are independent, [#176](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/176) needs #174, and [#177](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/177) needs #176 and #175. Main's terminal plays beside a ticket graph and a seat timeline drawn from the run's agenda state file and seat session logs: #174 and #175 start together, #176 starts the moment #174 is Done while #175 is still in review, three seats from three tickets work at once, and #177 waits for the later of its two dependencies before [#178](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/178) closes. The video pauses and zooms at each of those moments; idle time is cut, Main's activity plays at 2× and seat-only stretches at 12×.
 
