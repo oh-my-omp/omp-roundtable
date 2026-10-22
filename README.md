@@ -2,6 +2,12 @@
 
 Roundtable delivers GitHub issue graphs through durable tickets, source-confirmed effects, one-shot Owner sessions, and fresh independent gates. Main chooses which independent tickets run concurrently and which dependency edges enforce serial delivery.
 
+## Demo
+
+[![omp-roundtable delivering a three-ticket issue tree](https://raw.githubusercontent.com/oh-my-omp/omp-roundtable/main/docs/demo/roundtable-demo.gif)](https://github.com/oh-my-omp/omp-roundtable/blob/main/docs/demo/roundtable-demo.mp4)
+
+A real run of `omp --roundtable RiriAgent/rt-e2e-20260930-0931#160` with every model on `openai-codex/gpt-6.1-sol`. Main convenes three tickets; the Owners of [#158](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/158) and [#159](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/159) work in parallel; [#161](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/161) starts only after both merge; a gate seat escalates and Main records a ruling; post-merge and closure seats verify `main` before [#160](https://github.com/RiriAgent/rt-e2e-20260930-0931/issues/160) closes. The terminal was recorded headless in Tern with idle time removed and long stretches sped up 1.5–2×; the full-resolution video is [`docs/demo/roundtable-demo.mp4`](docs/demo/roundtable-demo.mp4).
+
 ## Starting a coordinator
 
 A roundtable starts from the issue it delivers, never from a switch inside a session. The issue carries one link:
