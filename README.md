@@ -16,6 +16,12 @@ A roundtable starts from the issue it delivers, never from a switch inside a ses
 http://127.0.0.1:47591/tern/<owner>/<repo>/issues/<number>?cwd=<absolute local checkout>
 ```
 
+GitHub strips inline `<svg>` from issue bodies, so the link is written as this repository's badge image wrapped in the link, not as a bare URL:
+
+```markdown
+[![Coordinate with Roundtable](https://raw.githubusercontent.com/oh-my-omp/omp-roundtable/main/docs/badge/coordinate-with-roundtable.svg)](http://127.0.0.1:47591/tern/<owner>/<repo>/issues/<number>?cwd=<absolute local checkout>)
+```
+
 Install the extension as an omp plugin (`omp plugin install omp-roundtable`), then install the link launcher once — from any omp session with `/roundtable-launcher install`, or from the package CLI with `omp-roundtable-launcher install`. `install` writes `~/Library/LaunchAgents/com.ohmyomp.roundtable-launcher.plist` and leaves `127.0.0.1:47591` answering; `uninstall` removes it and `status` reports it.
 
 The launcher holds no state of its own. It reads the link, calls Tern, and returns one page naming exactly one outcome: `launched` (a coordinator tab now runs `omp --roundtable <owner>/<repo>#<number>` in the link's `cwd`), `focused` (a live block already runs that exact reference and was focused instead), `rejected` (unsupported frontend, malformed path or number, a `cwd` that is not an existing absolute directory, or a request that is not a user's click navigation), or `frontendFailed` (Tern's own output). Tern's daemon outlives its window, so the launcher opens a window in the link's `cwd` first whenever no window client is connected: a block started without one would run invisibly. Only `Sec-Fetch-Mode: navigate` with `Sec-Fetch-User: ?1` is served, because any page can GET `127.0.0.1` and GitHub drops Referer on the https→http hop; the click is the operator's authorization. The port and the `tern` frontend are part of the published link contract.
