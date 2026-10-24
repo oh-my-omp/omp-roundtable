@@ -1,97 +1,62 @@
-# 本地链接启动连接
+# 启动链接连接
 
 ```vdm
 module Launcher
-imports from Ticket types IssueRef renamed IssueRef
+imports from Roundtable types IssueRef renamed IssueRef
 exports
-  types
-    BlockId;
-    struct Frontend; struct Navigation; struct Block;
-    struct TernSnapshot; struct TernProbe; struct LaunchOutcome
-  values
-    LauncherPort : nat1
+  types BlockId; struct Navigation; struct Block; struct Listing; struct Probe; struct Outcome
+  values LauncherPort : nat1
   functions
-    AuthorizedNavigation: Navigation -> bool;
-    RequiresWindowOpen: Navigation * TernProbe -> bool;
-    LiveCoordinatorBlocks: set of Block * IssueRef -> set of BlockId;
-    DecideLaunch: Navigation * TernProbe -> LaunchOutcome
+    Authorized: Navigation -> bool;
+    Running: set of Block * IssueRef -> set of BlockId;
+    Decide: Navigation * Probe -> Outcome
 definitions
 values
-  -- 已发布议题徽章链接固定的本地回环监听端口
+  -- 已发布启动链接固定的本地回环端口；写进议题的链接依赖它，不可配置
   LauncherPort : nat1 = 47591;
 
 types
-  -- 终端前端中单个运行块的身份；使用方不读内部结构
+  -- 终端里一个命令块的身份
   BlockId = token;
 
-  -- 链接路径请求的目标终端前端类别
-  Frontend = <Tern> | <Unsupported>;
-
-  -- 一次浏览器启动请求携带的导航与校验属性
+  -- 一次浏览器请求中决定能否启动的事实
   Navigation ::
-    isGet : bool  -- 请求方法是否为 GET
-    isNavigate : bool  -- Sec-Fetch-Mode 是否为 navigate
-    isUserActivated : bool  -- Sec-Fetch-User 是否为 ?1（用户点击激活）
-    frontend : Frontend  -- 路径请求的终端前端
-    cwdExists : bool  -- 查询参数 cwd 是否为本地已存在的绝对目录
-    issue : IssueRef;  -- 路径解析出的目标 GitHub 议题身份
+    clicked : bool  -- 请求是用户点击产生的顶层导航，而不是网页发出的子资源请求或预取
+    cwdUsable : bool  -- 链接给出的 cwd 是已存在的绝对目录
+    issue : IssueRef;  -- 链接指向的议题
 
-  -- 终端前端列出的单个命令块快照
+  -- 终端列出的一个命令块
   Block ::
     id : BlockId  -- 命令块身份
-    issue : IssueRef  -- 该命令块启动参数绑定的协调议题身份
-    live : bool  -- 命令块是否处于活动列出状态
-    exited : bool;  -- 命令块进程是否已退出
+    issue : IssueRef  -- 它运行的协调器所协调的议题
+    exited : bool;  -- 命令块的进程是否已经退出
 
-  -- 终端前端在探测成功时的窗口连接与命令块快照
-  TernSnapshot ::
-    windowConnected : bool  -- 是否有可见的窗口客户端连接到守护进程
-    blocks : set of Block;  -- 当前列出的全部命令块
+  -- 终端此刻列出的全部命令块
+  Listing ::
+    blocks : set of Block;  -- 全部命令块，包括已退出的
 
-  -- 终端前端探测结果：成功返回快照或前端命令执行失败
-  TernProbe = TernSnapshot | <FrontendUnreachable>;
+  -- 探测终端的结果：列出的命令块，或终端不可用
+  Probe = Listing | <Unreachable>;
 
-  -- 单次启动请求的四种可观察结局
-  LaunchOutcome = <Launched> | <Focused> | <Rejected> | <FrontendFailed>;
+  -- 一次请求的结局：已新开协调器、已聚焦现有协调器、拒绝、终端失败
+  Outcome = <Launched> | <Focused> | <Rejected> | <FrontendFailed>;
 
 functions
-  -- 判定请求是否为合法的用户点击导航且本地检出目录存在
-  AuthorizedNavigation: Navigation -> bool
-  AuthorizedNavigation(nav) ==
-    nav.isGet
-    and nav.isNavigate
-    and nav.isUserActivated
-    and nav.frontend = <Tern>
-    and nav.cwdExists;
+  -- 请求能否启动或聚焦协调器：只有用户点击且 cwd 可用；两个实现必须得出同一结论
+  Authorized: Navigation -> bool
+  Authorized(n) == n.clicked and n.cwdUsable;
 
-  -- 判定在聚焦或启动协调器标签页前是否必须先在目标目录拉起可见的终端窗口
-  RequiresWindowOpen: Navigation * TernProbe -> bool
-  RequiresWindowOpen(nav, probe) ==
-    AuthorizedNavigation(nav)
-    and cases probe:
-          mk_TernSnapshot(w, -) -> not w,
-          others -> true
-        end;
+  -- 某议题正在运行的协调器：协调这个议题、进程尚未退出的命令块；终端是唯一依据
+  Running: set of Block * IssueRef -> set of BlockId
+  Running(bs, i) == {b.id | b in set bs & b.issue = i and not b.exited};
 
-  -- 筛选终端中已绑定同一议题且进程尚未退出的活动协调器块
-  LiveCoordinatorBlocks: set of Block * IssueRef -> set of BlockId
-  LiveCoordinatorBlocks(blocks, issue) ==
-    {b.id | b in set blocks & b.issue = issue and b.live and not b.exited};
-
-  -- 判定一次链接请求在窗口就绪检查后的最终结局：拒绝非法请求、无可见窗口或前端不可达时报告前端失败、聚焦已有活动块或启动新标签页
-  DecideLaunch: Navigation * TernProbe -> LaunchOutcome
-  DecideLaunch(nav, probe) ==
-    if not AuthorizedNavigation(nav)
-    then <Rejected>
-    else
-      cases probe:
-        mk_TernSnapshot(w, blocks) ->
-          if not w
-          then <FrontendFailed>
-          elseif LiveCoordinatorBlocks(blocks, nav.issue) <> {}
-          then <Focused>
-          else <Launched>,
-        others -> <FrontendFailed>
-      end;
+  -- 一次请求的结局：未授权拒绝；终端不可用报终端失败；已有协调器则聚焦，否则新开
+  Decide: Navigation * Probe -> Outcome
+  Decide(n, p) ==
+    if not Authorized(n) then <Rejected>
+    else cases p:
+           mk_Listing(bs) -> if Running(bs, n.issue) <> {} then <Focused> else <Launched>,
+           others -> <FrontendFailed>
+         end;
 end Launcher
 ```
