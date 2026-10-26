@@ -8,4 +8,4 @@ Main 决定每张票据何时上桌，每张只上桌一次，之后由系统自
 
 Main 在回合结束时只被尚未告诉过它、且仍未解决的事唤醒；它在同一回合里自己解决的事不再唤醒它（来源：README「Ticket handoff」），由 ``Coordination`Notify`` 走通。
 
-议程只在交付全部完成、没有在跑的席位时由 Main 结束（来源：README「Ticket handoff」），由 ``Coordination`Close`` 走通。
+议程只在交付全部完成、有父议题时收口已完成、没有在跑的席位时由 Main 结束（来源：README「Ticket handoff」），由 ``Coordination`Close`` 走通。

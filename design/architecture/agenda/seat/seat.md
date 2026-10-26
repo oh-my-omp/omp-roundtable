@@ -17,7 +17,7 @@ exports
   operations
     Acquire: Slot * StepKind ==> AcquireOutcome;
     End: SeatId ==> Ended;
-    Live: () ==> set of TicketId;
+    Live: () ==> set of [TicketId];
     Dispatch: Slot * StepKind ==> AcquireOutcome;
     Close: SeatId ==> Ended;
     Recover: RunId * Slot * StepKind ==> AcquireOutcome
@@ -26,9 +26,9 @@ types
   -- 一次席位运行的身份；宿主造出，结束时交回
   SeatId = token;
 
-  -- 一个派发槽位：哪张票据、哪一步、哪个工作期；一个进程内每个槽位至多派发一次
+  -- 一个派发槽位：哪张票据（为空即收口）、哪一步、哪个工作期；一个进程内每个槽位至多派发一次
   Slot ::
-    ticket : TicketId  -- 席位绑定的票据
+    ticket : [TicketId]  -- 席位绑定的票据；为空即收口的评判席位
     step : nat1  -- 席位执行的步骤
     revision : Revision;  -- 派发时的工作期
 
@@ -55,7 +55,7 @@ types
     slot : Slot  -- 结束的槽位
     ending : Ending;  -- 是否完成交接
 
-  -- 本进程的席位：每个槽位至多一个席位；在跑的席位都已登记；交接点只指向本票据已结束的产出席位
+  -- 本进程的席位：每个槽位至多一个席位；在跑的席位都已登记；产出席位都绑定票据；交接点只指向本票据已结束的产出席位
 state Seats of
   slots : map SeatId to Slot  -- 本进程派发过的席位及其槽位
   kinds : map SeatId to StepKind  -- 每个席位执行的步骤种类
@@ -64,6 +64,7 @@ state Seats of
   inv mk_Seats(s, k, l, p) ==
     dom k = dom s and l subset dom s
     and (forall a, b in set dom s & a <> b => s(a) <> s(b))
+    and (forall x in set dom s & k(x) = <Produce> => s(x).ticket <> nil)
     and (forall t in set dom p &
            p(t) in set dom s and s(p(t)).ticket = t and k(p(t)) = <Produce> and p(t) not in set l)
   init q == q = mk_Seats({|->}, {|->}, {}, {|->})
@@ -101,23 +102,24 @@ operations
   ext rd slots rd kinds wr live wr last
   pre seat in set live
   post live = live~ \ {seat} and r.slot = slots(seat)
-       and ((r.ending = <HandedOff> and kinds(seat) = <Produce>
-               and last = last~ ++ {slots(seat).ticket |-> seat})
-            or ((r.ending = <Abandoned> or kinds(seat) <> <Produce>) and last = last~));
+       and let t = slots(seat).ticket in
+         ((r.ending = <HandedOff> and kinds(seat) = <Produce> and t <> nil
+             and last = last~ ++ {t |-> seat})
+          or ((r.ending = <Abandoned> or kinds(seat) <> <Produce>) and last = last~));
 
-  -- 读取有在跑席位的票据；只读
-  Live() r: set of TicketId
+  -- 读取有在跑席位的票据（空表示收口）；只读
+  Live() r: set of [TicketId]
   ext rd slots rd live
   post r = {slots(s).ticket | s in set live};
 
-  -- 场景：派发一个槽位；宿主起不来时票据交给 Main，不重新派发
+  -- 场景：派发一个槽位；宿主起不来时票据或收口交给 Main，不重新派发
   Dispatch: Slot * StepKind ==> AcquireOutcome
   Dispatch(slot, kind) ==
     let r = Acquire(slot, kind) in
       (if r = <Failed> then let - = Except(slot.ticket, slot.revision) in skip;
        return r);
 
-  -- 场景：席位结束；未交接就结束时票据交给 Main，不重新派发（工作期已被取代时 Except 拒收）
+  -- 场景：席位结束；未交接就结束时票据或收口交给 Main，不重新派发（工作期已被取代时 Except 拒收）
   Close: SeatId ==> Ended
   Close(seat) ==
     let r = End(seat) in
