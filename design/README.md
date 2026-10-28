@@ -14,3 +14,5 @@
 - [architecture/launcher/launcher.md](architecture/launcher/launcher.md)
 - [business/coordination/README.md](business/coordination/README.md)
 - [business/coordination/coordination.md](business/coordination/coordination.md)
+- [business/relay/README.md](business/relay/README.md)
+- [business/relay/relay.md](business/relay/relay.md)
