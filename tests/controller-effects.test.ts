@@ -98,8 +98,8 @@ test('Main can adopt a source-confirmed external merge below the target head in 
   const main:Caller={kind:'main',agentId:'Main',sessionId:'external-main',sessionFile:null};controller.setMain(main);
   try {
     expect((await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]})).ok).toBe(true);
-    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:1,ruling:'The author merged this change externally; verify the contained merge.',to:'Verifying',adoptPr:prRef});
-    expect(adopted.ok).toBe(true);
+    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:controller.snapshot()!.tickets[0]!.revision,ruling:'The author merged this change externally; verify the contained merge.',to:'Verifying',adoptPr:prRef});
+    expect(adopted).toMatchObject({ok:true});
     expect(comparisons).toContain(`${merge}:${base}`);
     expect(controller.snapshot()?.tickets[0]).toMatchObject({state:'Verifying',terminal:{kind:'merged',mergeSha:merge}});
   }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}

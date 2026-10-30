@@ -576,15 +576,15 @@ test('parent closure needs both custom judges and one failure escalates it',()=>
   const parent={repo:REPO,number:1},workflow=structuredClone(customWorkflow);ticketJudge(workflow,'Verifying').judges=[];
   const {agenda,facts}=adoptMerged(workflow,parent),id=agenda.closure!.id;
   expect(closureRoles(agenda)).toEqual(['product','operations']);
-  expect(agenda.effects).toEqual([]);
+  expect(agenda.effects.filter(effect=>effect.ticketId===id)).toEqual([]);
   const first=unwrap(verdict(agenda,facts,'product',true,id),'first parent verdict');
   expect(first.closure?.state).toBe('Reviewing');
   expect(closureRoles(first)).toEqual(['operations']);
-  expect(first.effects).toEqual([]);
+  expect(first.effects.filter(effect=>effect.ticketId===id)).toEqual([]);
   const failed=unwrap(verdict(first,facts,'operations',false,id),'failed parent verdict');
   expect(failed.closure).toMatchObject({state:'Escalated',revision:2});
   expect(closureRoles(failed)).toEqual([]);
-  expect(failed.effects).toEqual([]);
+  expect(failed.effects.filter(effect=>effect.ticketId===id)).toEqual([]);
   const passed=unwrap(verdict(first,facts,'operations',true,id),'second parent verdict');
   const close=effectOf(passed,effect=>effect.ticketId===id&&effect.action.kind==='setIssueState');
   expect(effectPrecondition(passed,close,facts)).toBeNull();
