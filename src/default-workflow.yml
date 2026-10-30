@@ -4,13 +4,18 @@
 # State kinds:
 #   work      one seat (role, agent, brief) that submits a branch; later seats of the role fork its session
 #   judge     judges on a subject (pullRequest: the exact PR head; mergeCommit: the merge commit)
-#   action    one GitHub write: publishPr, merge, closeIssue, rerunChecks (parent: closeParent)
-#   decision  waits until the first branch whose condition holds
-#   final     delivered: the issue is closed and its merge (or noCode ruling) still holds
+#   action    one GitHub write: publishPr, merge, closeIssue, rerunChecks (parent: closeParent);
+#             merge, closeIssue and closeParent take `requires`: judge states whose approval they need
+#   decision  moves to the first branch whose condition holds; an unconditional last branch is its fallback,
+#             and without one it waits
+#   final     delivered: the issue is closed and its merge or noCode ruling still holds
+#             (parent: the parent issue is closed and the children are the ones judged)
 # Any state may take an entry condition `when` with a fallback `otherwise`.
 # An outcome leads to a state, `escalate` (Main's ruling), or a list of branches `[{when, to}, ..., {to}]`.
 # Conditions: {checks: passing|failing|pending|unknown}, {mergeable: 'yes'|'no'|behind|draft|unknown},
-#   {visits: {state, atLeast}}, {all: [...]}, {any: [...]}, {not: {...}}.
+#   {visits: {state, atLeast}}, {all: [...]}, {any: [...]}, {not: {...}}; the parent machine has no PR checks.
+# `observe` on a pullRequest judge, a merge action or a decision routes checksFailed, conflict, behind and
+#   drift while the ticket holds an open PR; an event it leaves out escalates.
 ticket:
   initial: Coding
   # Where a ticket convened with an adopted PR starts: an open PR, or one already merged.
