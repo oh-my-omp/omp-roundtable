@@ -51,7 +51,7 @@ function effectOf(state:Agenda,match:(effect:Effect)=>boolean):Effect {
   return effect;
 }
 
-function seat(role:Role,sessionFile:string,revision:number):Caller {
+function seat(role:Role,sessionFile:string,revision:number):Extract<Caller,{kind:'seat'}> {
   return {agentId:`${role}-agent`,sessionId:`${role}-session`,sessionFile,kind:'seat',ticketId:TICKET,role,revision};
 }
 

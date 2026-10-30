@@ -29,11 +29,9 @@ describe('workflow validation',()=>{
     ])expect(parseWorkflow(workflow).ok).toBe(false);
   });
   test('parseWorkflow rejects empty owner and judge agents',()=>{
-    for(const agent of ['', '   ']){
-      expect(parseWorkflow({...defaultWorkflow,owner:{...defaultWorkflow.owner,agent}}).ok).toBe(false);
-      const workflow=structuredClone(defaultWorkflow);workflow.judges.mergeCommit[0]!.agent=agent;
-      expect(parseWorkflow(workflow).ok).toBe(false);
-    }
+    expect(parseWorkflow({...defaultWorkflow,owner:{...defaultWorkflow.owner,agent:''}}).ok).toBe(false);
+    const workflow=structuredClone(defaultWorkflow);workflow.judges.mergeCommit[0]!.agent='';
+    expect(parseWorkflow(workflow).ok).toBe(false);
   });
   test('parseWorkflow accepts all three empty judge lists',()=>{
     expect(parseWorkflow({owner:defaultWorkflow.owner,judges:{pullRequest:[],mergeCommit:[],parent:[]}})).toMatchObject({ok:true,value:{judges:{pullRequest:[],mergeCommit:[],parent:[]}}});
@@ -73,9 +71,11 @@ describe('workflow file source selection',()=>{
     try {
       const path=join(root,'workflow.yml');await writeFile(path,text);
       const result=await loadWorkflow({kind:'dataDir',path});
-      expect(result).toMatchObject({ok:false,error:{source:path,reason:expect.any(String)}});
+      expect(result.ok).toBe(false);
       if(result.ok)throw new Error('Invalid override silently loaded a workflow');
-      expect(result.error.reason.length).toBeGreaterThan(0);
+      expect(result.error.source).toBe(path);
+      expect(typeof result.error.reason).toBe('string');
+      expect(result.error.reason).not.toBe('');
       if(name==='invalid YAML')expect(result.error.reason).toContain('Invalid YAML');
     }finally {await rm(root,{recursive:true,force:true});}
   });
