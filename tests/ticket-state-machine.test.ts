@@ -1,6 +1,6 @@
 import {describe,expect,test} from 'bun:test';
 import {createHash} from 'node:crypto';
-import type {Agenda,Caller,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket,Workflow} from '../src/domain/model.ts';
+import type {Agenda,Caller,DomainError,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket,Workflow} from '../src/domain/model.ts';
 import {applyOperation,availableRoles,closureRoles,confirmEffect,createAgenda,effectPrecondition,reconcile,satisfiedResult} from '../src/domain/engine.ts';
 import {YAML} from 'bun';
 import {parseAgenda,parseWorkflow} from '../src/domain/parse.ts';
@@ -460,4 +460,158 @@ test('closure fingerprints survive unrelated forward merges but reject lost chil
   const caller:Caller={kind:'seat',agentId:'closure',sessionId:'closure',sessionFile:'/tmp/closure.jsonl',ticketId:closure.id,revision,role:'closure'};
   const passed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:closure.id,revision,role:'closure',ok:true,note:'Every terminal remains contained in the current target.'},caller,advanced,AT+3),'stable closure');
   expect(passed.closure?.gate.verdicts).toEqual([{role:'closure',status:'passed',note:'Every terminal remains contained in the current target.'}]);
+});
+
+const customWorkflow:Workflow={
+  owner:{agent:'task:high',brief:'Implement the requested delivery.'},
+  judges:{
+    pullRequest:[{role:'security',agent:'task:mid',brief:'Audit the change.'},{role:'usability',agent:'task:mid',brief:'Check user behavior.'}],
+    mergeCommit:[{role:'deployment',agent:'task:mid',brief:'Verify the merged delivery.'}],
+    parent:[{role:'product',agent:'task:mid',brief:'Check all child outcomes.'},{role:'operations',agent:'task:mid',brief:'Confirm readiness.'}],
+  },
+};
+function verdict(agenda:Agenda,facts:Facts,role:Role,ok=true,ticketId=TICKET):Result<Agenda,DomainError> {
+  const revision=ticketId===agenda.closure?.id?agenda.closure.revision:ticketOf(agenda,ticketId).revision;
+  return applyOperation(agenda,{op:'verdict',ticketId,revision,role,ok,note:`${role} ${ok?'approves':'rejects'} the delivery.`},{...seat(role,`/tmp/${role}.jsonl`,revision),ticketId},facts,AT);
+}
+function adoptMerged(workflow:Workflow,parent:IssueRef|null=null):{agenda:Agenda;facts:Facts} {
+  const facts=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:parent?'closed':'open',lastClose:parent?{id:'child-closed',at:CLOSED_AT}:null});
+  if(parent)facts.issues.push({...issueSnapshot('open',null),ref:parent,children:[ISSUE]});
+  const agenda=unwrap(createAgenda({op:'convene',parent,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:PR}]},workflow,facts,AT,'aaaabbbb-1111-4111-8111-111111111111'),'adopt merged');
+  return {agenda,facts};
+}
+
+test('a custom pullRequest roster requires both named judges before enqueuing merge',()=>{
+  const {agenda,facts}=publishTicket(customWorkflow);
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['security','usability']);
+  const first=unwrap(verdict(agenda,facts,'security'),'first custom verdict');
+  expect(ticketOf(first).state).toBe('Reviewing');
+  expect(availableRoles(first,ticketOf(first))).toEqual(['usability']);
+  expect(first.effects.filter(effect=>effect.action.kind==='merge')).toEqual([]);
+  const second=unwrap(verdict(first,facts,'usability'),'second custom verdict');
+  expect(ticketOf(second).state).toBe('Merging');
+  expect(second.effects.filter(effect=>effect.action.kind==='merge')).toHaveLength(1);
+});
+
+test('either custom pullRequest judge can reject the delivery back to Coding',()=>{
+  for(const role of ['security','usability']){
+    const {agenda,facts}=publishTicket(customWorkflow);
+    const other=role==='security'?'usability':'security';
+    const approved=unwrap(verdict(agenda,facts,other),'other judge approval');
+    const rejected=unwrap(verdict(approved,facts,role,false),'custom rejection');
+    expect(ticketOf(rejected)).toMatchObject({state:'Coding',revision:2,gates:{pullRequest:null,mergeCommit:null}});
+    expect(rejected.effects.some(effect=>effect.action.kind==='merge')).toBe(false);
+    expect(ticketOf(rejected).notes.at(-1)).toMatchObject({author:{kind:'seat',role},kind:'finding',text:`${role} rejects the delivery.`});
+  }
+});
+
+test('a verdict from another stage or an unknown role cannot approve a pullRequest',()=>{
+  const {agenda,facts}=publishTicket(customWorkflow),before=structuredClone(agenda);
+  for(const role of ['deployment','product','stranger'])expect(verdict(agenda,facts,role).ok).toBe(false);
+  expect(agenda).toEqual(before);
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['security','usability']);
+});
+
+test('an empty pullRequest roster still waits for mergeability and checks then merges without verdicts',()=>{
+  const workflow=structuredClone(customWorkflow);workflow.judges.pullRequest=[];
+  const facts=scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'});
+  facts.prs[0]!.mergeable='unknown';
+  const agenda=unwrap(createAgenda({op:'convene',parent:null,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:PR}]},workflow,facts,AT,'empty-review'),'adopt PR');
+  expect(ticketOf(agenda)).toMatchObject({state:'Reviewing',gates:{pullRequest:null}});
+  expect(agenda.effects).toEqual([]);
+  facts.prs[0]!.mergeable='yes';facts.prs[0]!.checks={kind:'pending',required:[{identity:{name:'ci',source:{kind:'any'}},head:HEAD}]};
+  reconcile(agenda,facts,AT+1);
+  expect(ticketOf(agenda).state).toBe('Reviewing');
+  expect(agenda.effects).toEqual([]);
+  facts.prs[0]!.checks={kind:'passing',required:[]};
+  reconcile(agenda,facts,AT+2);
+  expect(ticketOf(agenda)).toMatchObject({state:'Merging',gates:{pullRequest:{verdicts:[]}}});
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual([]);
+  expect(effectPrecondition(agenda,effectOf(agenda,effect=>effect.action.kind==='merge'),facts)).toBeNull();
+});
+
+test('an empty mergeCommit roster queues issue closure after merge confirmation and reaches Done',()=>{
+  const workflow=structuredClone(customWorkflow);workflow.judges.pullRequest=[];workflow.judges.mergeCommit=[];
+  const {agenda}=publishTicket(workflow);
+  const facts=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:'open'});
+  const merge=effectOf(agenda,effect=>effect.action.kind==='merge');
+  const merged=satisfiedResult(agenda,merge,facts);if(!merged)throw new Error('Expected merged source');
+  confirmEffect(agenda,merge,merged,facts,AT);
+  expect(ticketOf(agenda)).toMatchObject({state:'Verifying',gates:{mergeCommit:{verdicts:[]}}});
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual([]);
+  const close=effectOf(agenda,effect=>effect.action.kind==='setIssueState');
+  expect(close.action).toMatchObject({issue:ISSUE,open:false});
+  expect(effectPrecondition(agenda,close,facts)).toBeNull();
+  facts.issues[0]!.state='closed';facts.issues[0]!.lastClose={id:'closed',at:CLOSED_AT};
+  const closed=satisfiedResult(agenda,close,facts);if(!closed)throw new Error('Expected issue closure');
+  confirmEffect(agenda,close,closed,facts,AT);
+  expect(ticketOf(agenda).state).toBe('Done');
+});
+
+test('a custom mergeCommit judge rejection escalates instead of returning to Coding',()=>{
+  const {agenda,facts}=adoptMerged(customWorkflow);
+  expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['deployment']);
+  const rejected=unwrap(verdict(agenda,facts,'deployment',false),'merged rejection');
+  expect(ticketOf(rejected)).toMatchObject({state:'Escalated',revision:2});
+  expect(rejected.effects.some(effect=>effect.action.kind==='setIssueState')).toBe(false);
+});
+
+test('parent closure needs both custom judges and one failure escalates it',()=>{
+  const parent={repo:REPO,number:1},workflow=structuredClone(customWorkflow);workflow.judges.mergeCommit=[];
+  const {agenda,facts}=adoptMerged(workflow,parent),id=agenda.closure!.id;
+  expect(closureRoles(agenda)).toEqual(['product','operations']);
+  expect(agenda.effects).toEqual([]);
+  const first=unwrap(verdict(agenda,facts,'product',true,id),'first parent verdict');
+  expect(first.closure?.state).toBe('Reviewing');
+  expect(closureRoles(first)).toEqual(['operations']);
+  expect(first.effects).toEqual([]);
+  const failed=unwrap(verdict(first,facts,'operations',false,id),'failed parent verdict');
+  expect(failed.closure).toMatchObject({state:'Escalated',revision:2});
+  expect(closureRoles(failed)).toEqual([]);
+  expect(failed.effects).toEqual([]);
+  const passed=unwrap(verdict(first,facts,'operations',true,id),'second parent verdict');
+  const close=effectOf(passed,effect=>effect.ticketId===id&&effect.action.kind==='setIssueState');
+  expect(effectPrecondition(passed,close,facts)).toBeNull();
+  expect(close.action).toMatchObject({issue:parent,open:false});
+  facts.issues.find(issue=>issue.ref.number===parent.number)!.state='closed';
+  const closed=satisfiedResult(passed,close,facts);if(!closed)throw new Error('Expected parent closure');
+  confirmEffect(passed,close,closed,facts,AT);
+  expect(passed.closure?.state).toBe('Done');
+});
+
+test('an empty parent roster closes the parent without offering a seat',()=>{
+  const parent={repo:REPO,number:1},workflow=structuredClone(customWorkflow);workflow.judges.mergeCommit=[];workflow.judges.parent=[];
+  const {agenda,facts}=adoptMerged(workflow,parent);
+  expect(agenda.closure).toMatchObject({state:'Reviewing',gate:{verdicts:[]}});
+  expect(closureRoles(agenda)).toEqual([]);
+  const close=effectOf(agenda,effect=>effect.ticketId===agenda.closure!.id&&effect.action.kind==='setIssueState');
+  expect(effectPrecondition(agenda,close,facts)).toBeNull();
+  facts.issues.find(issue=>issue.ref.number===parent.number)!.state='closed';
+  const closed=satisfiedResult(agenda,close,facts);if(!closed)throw new Error('Expected parent closure');
+  confirmEffect(agenda,close,closed,facts,AT);
+  expect(agenda.closure?.state).toBe('Done');
+});
+
+test('parseAgenda rejects missing, extra, reordered or wrong-stage pullRequest verdict roles',()=>{
+  const {agenda}=publishTicket(customWorkflow);agenda.id='aaaabbbb-1111-4111-8111-111111111111';
+  expect(parseAgenda(agenda).ok).toBe(true);
+  const original=ticketOf(agenda).gates.pullRequest!.verdicts;
+  for(const roles of [['security'],['security','usability','extra'],['usability','security'],['security','deployment']]){
+    const invalid=structuredClone(agenda);
+    ticketOf(invalid).gates.pullRequest!.verdicts=roles.map(role=>({role,status:'pending',note:''}));
+    expect(parseAgenda(invalid)).toMatchObject({ok:false,error:{path:'tickets'}});
+  }
+  expect(ticketOf(agenda).gates.pullRequest!.verdicts).toEqual(original);
+});
+
+test('parseAgenda rejects mergeCommit and parent verdicts outside their frozen rosters',()=>{
+  const {agenda}=adoptMerged(customWorkflow);
+  expect(parseAgenda(agenda).ok).toBe(true);
+  ticketOf(agenda).gates.mergeCommit!.verdicts[0]!.role='security';
+  expect(parseAgenda(agenda)).toMatchObject({ok:false,error:{path:'tickets'}});
+  const workflow=structuredClone(customWorkflow);workflow.judges.mergeCommit=[];
+  const {agenda:parent}=adoptMerged(workflow,{repo:REPO,number:1});
+  expect(parseAgenda(parent).ok).toBe(true);
+  parent.closure!.gate.verdicts.reverse();
+  expect(parseAgenda(parent)).toMatchObject({ok:false,error:{path:'closure'}});
 });

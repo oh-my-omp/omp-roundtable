@@ -75,7 +75,7 @@ function harness(root:string,workflow:Workflow=defaultWorkflow) {
   // run() is the entry the kick timer uses; calling it directly drains effects and relays deterministically.
   async function drain():Promise<void> {for(let round=0;round<4;round++)await roundtable.run();}
   return {
-    source,setBase,launches,wakes,errors,controller:roundtable,
+    source,setBase,launches,wakes,errors,github,host,controller:roundtable,
     async asMain(input:Parameters<RoundtableController['execute']>[1]) {const result=await roundtable.execute(main,input);observe();return result;},
     async asSeat(ticketId:string,role:Role,input:Parameters<RoundtableController['execute']>[1]) {
       const seat=live.get(`${ticketId}/${role}`);if(!seat)throw new Error(`No live ${role} seat for ${ticketId}`);
@@ -206,4 +206,62 @@ test('a seat that ends without a handoff while a refresh is in flight is not re-
     expect(h.launches.filter(seat=>seat.ticketId==='A'&&seat.role==='owner').map(seat=>seat.revision)).toEqual([1]);
     expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'Escalated',revision:2});
   }finally {await h.controller.shutdown();await rm(root,{recursive:true,force:true});}
+});
+
+test('the relay uses each configured role agent and brief from Owner through parent closure',async()=>{
+  const root=await mkdtemp('/tmp/roundtable-custom-relay-');
+  const workflow:Workflow={owner:{agent:'builder',brief:'Build the requested customer behavior.'},judges:{
+    pullRequest:[{role:'audit',agent:'security-agent',brief:'Audit the security boundary.'},{role:'experience',agent:'ux-agent',brief:'Inspect the user journey.'}],
+    mergeCommit:[{role:'deployed',agent:'runtime-agent',brief:'Exercise the merged runtime.'}],
+    parent:[{role:'aggregate',agent:'product-agent',brief:'Confirm the combined product outcome.'}],
+  }};
+  const h=harness(root,workflow);
+  h.source.issues.find(issue=>issue.ref.number===issueB.number)!.children=[issueA];
+  try {
+    expect((await h.asMain({op:'convene',parent:issueB,tickets:[{id:'A',issue:issueA,target,dependsOn:[],adoptPr:null}]})).ok).toBe(true);
+    expect((await h.asMain({op:'launch',ticketId:'A'})).ok).toBe(true);
+    expect((await h.asSeat('A','owner',{op:'submit',ticketId:'A',revision:1,branch:'feature-1',head:HEAD,title:'Deliver A',body:closes(1)})).ok).toBe(true);
+    h.exit('A','owner',true);await h.drain();
+    h.source.prs[0]!.mergeable='yes';h.source.prs[0]!.checks={kind:'passing',required:[]};
+    await h.drain();
+    for(const role of ['audit','experience']){
+      expect((await h.asSeat('A',role,{op:'verdict',ticketId:'A',revision:h.revision('A'),role,ok:true,note:'The open PR satisfies the contract.'})).ok).toBe(true);
+      h.exit('A',role,true);
+    }
+    await h.drain();
+    expect((await h.asSeat('A','deployed',{op:'verdict',ticketId:'A',revision:h.revision('A'),role:'deployed',ok:true,note:'Merged delivery works.'})).ok).toBe(true);
+    h.exit('A','deployed',true);await h.drain();
+    const closure=h.controller.snapshot()!.closure!;
+    expect((await h.asSeat(closure.id,'aggregate',{op:'verdict',ticketId:closure.id,revision:closure.revision,role:'aggregate',ok:true,note:'All outcomes satisfy the parent.'})).ok).toBe(true);
+    h.exit(closure.id,'aggregate',true);await h.drain();
+    expect(h.controller.snapshot()!.closure?.state).toBe('Done');
+    expect(h.launches.map(seat=>[seat.role,seat.agent])).toEqual([
+      ['owner','builder'],['audit','security-agent'],['experience','ux-agent'],['deployed','runtime-agent'],['aggregate','product-agent'],
+    ]);
+    for(const configured of [{role:'owner',...workflow.owner},...Object.values(workflow.judges).flat()]){
+      const launch=h.launches.find(seat=>seat.role===configured.role)!;
+      expect(launch.prompt).toContain(configured.brief);
+    }
+    expect(h.errors).toEqual([]);
+  }finally {await h.controller.shutdown();await rm(root,{recursive:true,force:true});}
+});
+
+test('resume uses the frozen workflow without calling the current workflow loader',async()=>{
+  const root=await mkdtemp('/tmp/roundtable-frozen-resume-');
+  const workflow=structuredClone(defaultWorkflow);workflow.owner={agent:'original-builder',brief:'Use the originally approved implementation brief.'};
+  const h=harness(root,workflow);
+  let resumed:RoundtableController|null=null,loads=0;
+  try {
+    expect((await h.asMain({op:'convene',parent:null,tickets:[{id:'A',issue:issueA,target,dependsOn:[],adoptPr:null}]})).ok).toBe(true);
+    const id=h.controller.snapshot()!.id;await h.controller.shutdown();
+    resumed=new RoundtableController({files:createAgendaFiles(root),github:h.github,host:h.host,cwd:root,workflow:async()=>{loads++;throw new Error('Current workflow is unavailable');},intervalSeconds:3600,onChange:()=>{},onError:error=>h.errors.push(error)});
+    const main:Caller={kind:'main',agentId:'successor',sessionId:'successor-main',sessionFile:null};resumed.setMain(main);
+    expect((await resumed.execute(main,{op:'resume',agenda:id,operatorConfirmedOriginalSessionEnded:true})).ok).toBe(true);
+    expect((await resumed.execute(main,{op:'launch',ticketId:'A'})).ok).toBe(true);
+    expect(loads).toBe(0);
+    expect(h.launches[0]?.agent).toBe('original-builder');
+    expect(h.launches[0]?.prompt).toContain('Use the originally approved implementation brief.');
+    expect(resumed.snapshot()!.workflow).toEqual(workflow);
+    expect(h.errors).toEqual([]);
+  }finally {await resumed?.shutdown();await h.controller.shutdown();await rm(root,{recursive:true,force:true});}
 });
