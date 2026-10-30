@@ -26,7 +26,7 @@ const ownerRoundSchema = z.union([
 ]);
 export type OwnerRound = z.infer<typeof ownerRoundSchema>;
 
-const rulingSchema = z.object({to: z.enum(['Coding', 'Reviewing', 'Verifying', 'Done']), ruling: z.string(), noCode: z.string().optional()});
+const rulingSchema = z.object({to: z.string(), ruling: z.string(), noCode: z.string().optional()});
 export type Ruling = z.infer<typeof rulingSchema>;
 
 const ticketSpecSchema = z.object({
@@ -35,8 +35,10 @@ const ticketSpecSchema = z.object({
   dependsOn: z.array(z.string()),
   /** Owner behaviour per round; a round is one Owner handoff, or one seat that ended without a handoff. */
   owner: z.array(ownerRoundSchema).min(1),
-  /** pullRequest and mergeCommit judges pass only when the checkout holds exactly these files. */
+  /** Judges pass only when the checkout holds exactly these files. */
   gate: expectSchema,
+  /** Per-judge expectations overriding `gate` for the named roles. */
+  judgeExpect: z.record(z.string(), expectSchema).optional(),
   /** Judges that wait for a marker file before inspecting their checkout. */
   hold: z.object({roles: z.array(z.string()), marker: z.string()}).optional(),
   /** Main's rulings for this ticket's escalations, in order. */
@@ -51,8 +53,10 @@ export const scenarioSchema = z.object({
   tickets: z.array(ticketSpecSchema),
   /** The parent-stage judges' expectation on the target branch. */
   closure: expectSchema,
-  /** The workflow's parent-stage judge roles; every other judge judges its own ticket. */
+  /** The workflow's parent judge roles; every other judge judges its own ticket. */
   parentRoles: z.array(z.string()),
+  /** The workflow's work roles, played by the scripted Owner. */
+  workRoles: z.array(z.string()),
   /** JSON lines of every scripted model call, for the driver's assertions. */
   log: z.string(),
 });

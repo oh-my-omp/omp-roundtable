@@ -33,7 +33,8 @@ export function buildPublicGrammar(z: PublicZ) {
   ]);
   const effectResolutionSchema = object({effectId:idSchema,disposition:z.enum(['retry','adopt','cancel'])});
   const resolveSchema = object({op:z.literal('resolve'),ticketId:idSchema,revision,ruling:text,
-    to:z.enum(['Coding','Reviewing','Verifying','Done']),
+    /** A state of the agenda's workflow machine: the ticket machine for a ticket, the parent machine for the closure. */
+    to:z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
     dependsOn:z.array(idSchema).optional(),target:targetSchema.optional(),adoptPr:prRefSchema.nullable().optional(),
     noCode:text.optional(),add:z.array(entrySchema).optional(),remove:z.array(idSchema).optional(),
     effects:z.array(effectResolutionSchema).optional(),actions:z.array(actionSchema).optional(),

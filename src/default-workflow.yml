@@ -1,25 +1,84 @@
-# Roundtable workflow: who works on a ticket and who judges each delivery stage.
-# The ticket states and GitHub effects are fixed; this file names the seats.
+# Roundtable workflow: the state machines every ticket and the parent closure move through.
 # An agenda freezes the workflow it was convened with; edits apply to the next convene.
-owner:
-  agent: task:high
-  brief: Implement the issue contract and current Main rulings.
-judges:
-  # The open PR head once it is mergeable with passing required checks; every judge must pass before merging.
-  pullRequest:
-    - role: review
-      agent: task:mid
-      brief: Independently verify the complete current contract against this checkout, not just prior findings.
-    - role: accept
-      agent: task:mid
-      brief: Independently verify the complete current contract against this checkout, not just prior findings.
-  # The merge commit in the target; every judge must pass before the issue is closed.
-  mergeCommit:
-    - role: postMerge
-      agent: task:mid
-      brief: Independently verify the complete current contract against this checkout, not just prior findings.
-  # The target branch once every child ticket is delivered; every judge must pass before the parent is closed.
-  parent:
-    - role: closure
-      agent: task:mid
-      brief: Independently verify the complete current contract against this checkout, not just prior findings.
+#
+# State kinds:
+#   work      one seat (role, agent, brief) that submits a branch; later seats of the role fork its session
+#   judge     judges on a subject (pullRequest: the exact PR head; mergeCommit: the merge commit)
+#   action    one GitHub write: publishPr, merge, closeIssue, rerunChecks (parent: closeParent)
+#   decision  waits until the first branch whose condition holds
+#   final     delivered: the issue is closed and its merge (or noCode ruling) still holds
+# Any state may take an entry condition `when` with a fallback `otherwise`.
+# An outcome leads to a state, `escalate` (Main's ruling), or a list of branches `[{when, to}, ..., {to}]`.
+# Conditions: {checks: passing|failing|pending|unknown}, {mergeable: 'yes'|'no'|behind|draft|unknown},
+#   {visits: {state, atLeast}}, {all: [...]}, {any: [...]}, {not: {...}}.
+ticket:
+  initial: Coding
+  # Where a ticket convened with an adopted PR starts: an open PR, or one already merged.
+  adopted: {pullRequest: AwaitingChecks, mergeCommit: Verifying}
+  states:
+    Coding:
+      kind: work
+      role: owner
+      agent: task:high
+      brief: Implement the issue contract and current Main rulings.
+      on: {submitted: Publishing, escalated: escalate}
+    Publishing:
+      kind: action
+      action: publishPr
+      on: {done: AwaitingChecks}
+    AwaitingChecks:
+      kind: decision
+      branches:
+        - when: {all: [{checks: passing}, {mergeable: 'yes'}]}
+          to: Reviewing
+      observe: {checksFailed: Coding, conflict: Coding, behind: Coding, drift: AwaitingChecks}
+    Reviewing:
+      kind: judge
+      subject: pullRequest
+      judges:
+        - role: review
+          agent: task:mid
+          brief: Independently verify the complete current contract against this checkout, not just prior findings.
+        - role: accept
+          agent: task:mid
+          brief: Independently verify the complete current contract against this checkout, not just prior findings.
+      observe: {checksFailed: Coding, conflict: Coding, behind: Coding, drift: AwaitingChecks}
+      on: {passed: Merging, rejected: Coding, escalated: escalate}
+    Merging:
+      kind: action
+      action: merge
+      requires: [Reviewing]
+      observe: {checksFailed: Coding, conflict: Coding, behind: Coding, drift: escalate}
+      on: {done: Verifying}
+    Verifying:
+      kind: judge
+      subject: mergeCommit
+      judges:
+        - role: postMerge
+          agent: task:mid
+          brief: Independently verify the complete current contract against this checkout, not just prior findings.
+      on: {passed: Closing, rejected: escalate, escalated: escalate}
+    Closing:
+      kind: action
+      action: closeIssue
+      requires: [Verifying]
+      on: {done: Done}
+    Done:
+      kind: final
+parent:
+  initial: Reviewing
+  states:
+    Reviewing:
+      kind: judge
+      judges:
+        - role: closure
+          agent: task:mid
+          brief: Verify the target branch delivers the complete parent issue across every child ticket.
+      on: {passed: Closing, rejected: escalate, escalated: escalate}
+    Closing:
+      kind: action
+      action: closeParent
+      requires: [Reviewing]
+      on: {done: Done}
+    Done:
+      kind: final

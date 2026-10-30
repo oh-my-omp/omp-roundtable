@@ -1,23 +1,23 @@
 import type {Agenda,Role} from '../domain/model.ts';
-import {awaitsLaunch} from '../domain/engine.ts';
-import {parentSeatRoles,ticketSeatRoles} from '../domain/workflow.ts';
+import {awaitsLaunch,delivered,parentDefinition} from '../domain/engine.ts';
+import {ESCALATED,parentSeatRoles,ticketSeatRoles} from '../domain/workflow.ts';
 
 /**
  * The decisions only Main can make, one key each: a ticket it may put on the table, an Escalated ticket or
  * closure awaiting its ruling (keyed by revision, so a re-escalation is new), and a finished agenda awaiting
- * `finish`. Seats running, effects in flight, and a confirmed noCode closure on its way are not decisions.
+ * `finish`. Seats running and effects in flight are not decisions.
  */
 export function attentionKeys(agenda:Agenda,active:(ticketId:string,role:Role)=>boolean):string[] {
   if(agenda.lifecycle!=='active')return [];
   const keys:string[]=[];
   for(const ticket of agenda.tickets){
     if(awaitsLaunch(agenda,ticket))keys.push(`launch:${ticket.id}`);
-    const closing=ticket.terminal?.kind==='noCode'&&agenda.effects.some(effect=>effect.ticketId===ticket.id&&effect.action.kind==='setIssueState'&&!effect.action.open&&(effect.state.kind==='ready'||effect.state.kind==='executing'));
-    if(ticket.state==='Escalated'&&!closing)keys.push(`escalated:${ticket.id}:${ticket.revision}`);
+    if(ticket.state===ESCALATED)keys.push(`escalated:${ticket.id}:${ticket.revision}`);
   }
-  if(agenda.closure?.state==='Escalated')keys.push(`escalated:${agenda.closure.id}:${agenda.closure.revision}`);
-  const ticketRoles=ticketSeatRoles(agenda.workflow),closure=agenda.closure;
-  const settled=agenda.tickets.every(ticket=>ticket.state==='Done')&&(!agenda.parent||closure?.state==='Done')
+  const closure=agenda.closure;
+  if(closure?.state===ESCALATED)keys.push(`escalated:${closure.id}:${closure.revision}`);
+  const ticketRoles=ticketSeatRoles(agenda.workflow);
+  const settled=agenda.tickets.every(ticket=>delivered(agenda,ticket))&&(!agenda.parent||closure!==null&&parentDefinition(agenda.workflow,closure)?.kind==='final')
     &&agenda.effects.every(effect=>effect.state.kind==='confirmed'||effect.state.kind==='cancelled')
     &&!agenda.tickets.some(ticket=>ticketRoles.some(role=>active(ticket.id,role)))
     &&!(closure&&parentSeatRoles(agenda.workflow).some(role=>active(closure.id,role)));

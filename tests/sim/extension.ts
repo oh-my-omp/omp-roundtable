@@ -176,7 +176,7 @@ function ownerStep(messages: Message[], spec: TicketSpec, brief: string): {step:
 function gateStep(messages: Message[], role: string, ticketId: string, brief: string): {step: Step; note: string} {
   const ticket = ticketOf(brief);
   const spec = scenario.tickets.find(item => item.id === ticketId);
-  const expect = scenario.parentRoles.includes(role) ? scenario.closure : spec!.gate;
+  const expect = scenario.parentRoles.includes(role) ? scenario.closure : spec!.judgeExpect?.[role] ?? spec!.gate;
   const hold = spec?.hold?.roles.some(item => item === role) ? spec.hold.marker : null;
   const step = messages.filter(message => message.role === 'assistant').length;
   if (step === 0) return {step: {call: {name: 'bash', args: {command: inspect(expect, hold), timeout: 0}}}, note: 'inspect'};
@@ -201,7 +201,7 @@ function respond(model: Model<Api>, context: Context, options?: SimpleStreamOpti
     const [role, ticketId] = [seat[1]!, seat[2]!];
     who = {kind: 'seat', role, ticket: ticketId};
     const spec = scenario.tickets.find(item => item.id === ticketId);
-    decided = role === 'owner' ? ownerStep(messages, spec!, brief) : gateStep(messages, role, ticketId, brief);
+    decided = scenario.workRoles.includes(role) ? ownerStep(messages, spec!, brief) : gateStep(messages, role, ticketId, brief);
   }
   // Tools that trace intent require an `i` argument; supply it only when the schema asks for it.
   const withIntent = (name: string, args: Record<string, unknown>) => {

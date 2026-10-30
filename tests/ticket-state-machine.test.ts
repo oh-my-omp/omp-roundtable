@@ -1,7 +1,7 @@
 import {describe,expect,test} from 'bun:test';
 import {createHash} from 'node:crypto';
 import type {Agenda,Caller,DomainError,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket,Workflow} from '../src/domain/model.ts';
-import {applyOperation,availableRoles,closureRoles,confirmEffect,createAgenda,effectPrecondition,reconcile,satisfiedResult} from '../src/domain/engine.ts';
+import {applyOperation,availableRoles,closureRoles,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../src/domain/engine.ts';
 import {YAML} from 'bun';
 import {encodeAgenda,parseAgenda} from '../src/domain/parse.ts';
 import {encodeWorkflow,parseWorkflow,type TicketState} from '../src/domain/workflow.ts';
@@ -837,12 +837,75 @@ test('decision states wait when no branch matches and move on a later source obs
 test('an unconditional decision loop reaches the hop limit and escalates instead of hanging',()=>{
   const workflow=configured(workflow=>{
     const awaiting=workflow.ticket.states.AwaitingChecks!;if(awaiting.kind!=='decision')throw new Error('Expected decision');
-    awaiting.branches=[{when:{kind:'checks',is:'passing'},to:'Loop'},{when:{kind:'all',of:[]},to:'Reviewing'}];
-    workflow.ticket.states.Loop={kind:'decision',guard:null,observe:structuredClone(awaiting.observe),branches:[{when:{kind:'all',of:[]},to:'AwaitingChecks'}]};
+    awaiting.branches=[{when:{kind:'checks',is:'passing'},to:'Loop'}];awaiting.otherwise='Reviewing';
+    workflow.ticket.states.Loop={kind:'decision',guard:null,observe:structuredClone(awaiting.observe),branches:[],otherwise:'AwaitingChecks'};
   });
   const facts=scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'}),agenda=adoptOpen(workflow,facts);
   expect(ticketOf(agenda).state).toBe('Escalated');
   expect(ticketOf(agenda).notes.at(-1)?.text).toContain('64 states without waiting');
   expect(ticketOf(agenda).visits.Loop).toBe(32);
   expect(agenda.effects).toEqual([]);
+});
+
+describe('review regressions',()=>{
+  const parent={repo:REPO,number:1};
+  function closedParent(){
+    const workflow=structuredClone(customWorkflow);ticketJudge(workflow,'Verifying').judges=[];parentJudge(workflow).judges=[];
+    const {agenda,facts}=adoptMerged(workflow,parent),id=agenda.closure!.id;
+    const close=effectOf(agenda,effect=>effect.ticketId===id&&effect.action.kind==='setIssueState');
+    facts.issues.find(issue=>issue.ref.number===parent.number)!.state='closed';
+    confirmEffect(agenda,close,satisfiedResult(agenda,close,facts)!,facts,AT);
+    return {agenda,facts,close};
+  }
+  test('a delivered parent escalates when its issue is reopened, and finish is refused',()=>{
+    const {agenda,facts}=closedParent();
+    expect(agenda.closure?.state).toBe('Done');
+    facts.issues.find(issue=>issue.ref.number===parent.number)!.state='open';
+    reconcile(agenda,facts,AT+1);
+    expect(agenda.closure?.state).toBe('Escalated');
+    expect(applyOperation(agenda,{op:'finish',summary:'Delivered.'},attachedMain(agenda),facts,AT+2)).toMatchObject({ok:false,error:{kind:'invalidTransition'}});
+  });
+  test('a parent machine whose initial state is final does not deliver an open parent',()=>{
+    const workflow=configured(workflow=>{workflow.parent={initial:'Done',states:{Done:{kind:'final',guard:null}}};ticketJudge(workflow,'Verifying').judges=[];});
+    const {agenda}=adoptMerged(workflow,parent);
+    expect(agenda.closure?.state).toBe('Escalated');
+    expect(agenda.closure?.notes.at(-1)).toContain('the parent issue is not closed');
+  });
+  test('a failed parent close can be cancelled through resolve and the parent re-reviewed',()=>{
+    const workflow=structuredClone(customWorkflow);ticketJudge(workflow,'Verifying').judges=[];parentJudge(workflow).judges=[];
+    const {agenda,facts}=adoptMerged(workflow,parent),id=agenda.closure!.id;
+    const close=effectOf(agenda,effect=>effect.ticketId===id&&effect.action.kind==='setIssueState');
+    failEffect(agenda,close,{kind:'permission',message:'Forbidden'},false,AT);
+    expect(agenda.closure?.state).toBe('Escalated');
+    const resolved=unwrap(applyOperation(agenda,{op:'resolve',ticketId:id,revision:agenda.closure!.revision,ruling:'Permission fixed; close again.',to:'Reviewing',effects:[{effectId:close.id,disposition:'cancel'}]},attachedMain(agenda),facts,AT),'closure resolve');
+    expect(resolved.effects.find(effect=>effect.id===close.id)?.state.kind).toBe('cancelled');
+    expect(resolved.effects.filter(effect=>effect.ticketId===id&&effect.state.kind==='ready')).toHaveLength(1);
+    expect(resolved.closure?.state).toBe('Closing');
+  });
+  test('a noCode ruling whose entry condition redirects away from closing is refused',()=>{
+    const workflow=configured(workflow=>{workflow.ticket.states.Done={kind:'final',guard:{when:{kind:'visits',state:'Coding',atLeast:3},otherwise:'Coding'}};});
+    const agenda=conveneTicket(workflow);
+    const result=applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:1,ruling:'Already satisfied.',to:'Done',noCode:'Nothing to change.'},attachedMain(agenda),openSource(),AT);
+    expect(result).toMatchObject({ok:false,error:{kind:'invalidTransition',message:expect.stringContaining('noCode must land')}});
+  });
+  test('an adopted ticket has not visited the initial work state',()=>{
+    const agenda=adoptOpen(defaultWorkflow,scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'}));
+    expect(ticketOf(agenda).visits.Coding).toBeUndefined();
+    expect(ticketOf(agenda).visits.AwaitingChecks).toBe(1);
+  });
+  test('changing the target drops work sessions so the next work seat checks out the new target',()=>{
+    const {agenda,facts}=publishTicket();
+    expect(ticketOf(agenda).sessions).toEqual({owner:OWNER_SESSION});
+    const moved=unwrap(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:ticketOf(agenda).revision,ruling:'Deliver on release instead.',to:'Coding',target:{repo:REPO,base:'release'}},attachedMain(agenda),facts,AT),'retarget');
+    expect(ticketOf(moved)).toMatchObject({state:'Coding',target:{repo:REPO,base:'release'},sessions:{}});
+  });
+  test('a state that waits on the 64th entry is entered rather than escalated as a loop',()=>{
+    const workflow=configured(workflow=>{
+      for(let index=1;index<=63;index++)workflow.ticket.states[`D${index}`]={kind:'decision',guard:null,observe:structuredClone((workflow.ticket.states.AwaitingChecks as Extract<TicketState,{kind:'decision'}>).observe),branches:[],otherwise:index===63?'Reviewing':`D${index+1}`};
+      workflow.ticket.adopted.pullRequest='D1';
+    });
+    const agenda=adoptOpen(workflow,scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'}));
+    expect(ticketOf(agenda).state).toBe('Reviewing');
+    expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['review','accept']);
+  });
 });

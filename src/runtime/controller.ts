@@ -1,9 +1,9 @@
 import {randomUUID} from 'node:crypto';
-import {JUDGE_STAGES,type Agenda,type Caller,type DomainError,type Effect,type EffectResult,type Facts,type PortError,type PortInput,type Result,type Role,type Workflow} from '../domain/model.ts';
-import {abandonSeat,applyOperation,availableRoles,awaitsLaunch,closureRoles,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
+import type {Agenda,Caller,DomainError,Effect,EffectResult,Facts,PortError,PortInput,Result,Role,Workflow} from '../domain/model.ts';
+import {abandonSeat,applyOperation,availableRoles,awaitsLaunch,closureRoles,confirmEffect,createAgenda,currentSeat,effectPrecondition,failEffect,reconcile,satisfiedResult,ticketDefinition} from '../domain/engine.ts';
 import {canonical,sameRef} from '../domain/identity.ts';
 import {seatBrief} from '../domain/briefs.ts';
-import {OWNER,parentSeatRoles,seatOf,ticketSeatRoles} from '../domain/workflow.ts';
+import {parentSeatRoles,ticketSeatRoles,workflowAgents} from '../domain/workflow.ts';
 import type {AgendaFiles,GitHubPort,HostPort,SeatExit,SeatHandle,SeatLaunch,SeatWorkspace,StateError,WorkflowError} from '../ports/contracts.ts';
 import {createSourceReader,type SourceReceipt} from './source.ts';
 
@@ -83,7 +83,7 @@ export class RoundtableController {
           if(active.length)return domain('ownershipBlocked','Resume the saved active agenda instead of creating a second owner');
           const workflow=await this.options.workflow();if(!workflow.ok)return {ok:false,error:{kind:'workflow',error:workflow.error}};
           // The workflow is frozen for the agenda's whole life, so a seat agent that cannot run is refused before it is.
-          const agents=await this.options.host.agents(this.options.cwd,[workflow.value.owner.agent,...JUDGE_STAGES.flatMap(stage=>workflow.value.judges[stage].map(judge=>judge.agent))]);
+          const agents=await this.options.host.agents(this.options.cwd,workflowAgents(workflow.value));
           if(!agents.ok)return {ok:false,error:{kind:'host',error:agents.error}};
           const facts=await this.source.read(null,operation,'convene');if(!facts.ok)return {ok:false,error:{kind:'source',error:facts.error}};
           const created=createAgenda(operation,workflow.value,facts.value,Date.now(),randomUUID());if(!created.ok)return {ok:false,error:{kind:'domain',error:created.error}};
@@ -167,29 +167,22 @@ export class RoundtableController {
   /** The launch input of a due seat, or null when the agenda no longer offers that role. */
   private seatLaunch(ticketId:string,role:Role):SeatLaunch|null {
     const state=this.state;if(!state)return null;
-    const seat=seatOf(state.workflow,role);if(!seat)return null;
+    const seat=currentSeat(state,ticketId,role);if(!seat)return null;
     const ticket=state.tickets.find(ticket=>ticket.id===ticketId),closure=state.closure?.id===ticketId?state.closure:null;
     let workspace:SeatWorkspace,revision:number;
     if(ticket){
       if(!availableRoles(state,ticket).includes(role))return null;
       revision=ticket.revision;
-      // A judge's stage decides its checkout: exactly the PR head or merge commit its stage stamp names, never the target branch.
-      switch(seat.stage){
-        case 'owner':workspace=ticket.ownerSessionFile?{kind:'fork',sessionFile:ticket.ownerSessionFile}:{kind:'base',target:ticket.target};break;
-        case 'pullRequest':{
-          const stamp=ticket.gates.pullRequest?.stamp;if(!stamp)return null;
-          workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.head,pull:stamp.pr.number};break;
-        }
-        case 'mergeCommit':{
-          const stamp=ticket.gates.mergeCommit?.stamp;if(!stamp)return null;
-          workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.commit,pull:null};break;
-        }
-        case 'parent':return null;
-      }
-    }else if(closure&&seat.stage==='parent'&&closureRoles(state).includes(role)){
+      const gate=ticket.gates[ticket.state],session=ticket.sessions[role];
+      // A work seat continues its role's session; a judge checks out exactly the PR head or merge commit its stamp names.
+      if(seat.kind==='work')workspace=session?{kind:'fork',sessionFile:session}:{kind:'base',target:ticket.target};
+      else if(gate?.stamp.kind==='pullRequest')workspace={kind:'commit',repo:gate.stamp.target.repo,sha:gate.stamp.head,pull:gate.stamp.pr.number};
+      else if(gate?.stamp.kind==='mergeCommit')workspace={kind:'commit',repo:gate.stamp.target.repo,sha:gate.stamp.commit,pull:null};
+      else return null;
+    }else if(closure&&closureRoles(state).includes(role)){
       revision=closure.revision;workspace={kind:'base',target:state.tickets[0]!.target};
     }else return null;
-    return {agendaId:state.id,ticketId,revision,role,agent:seat.agent,cwd:this.options.cwd,
+    return {agendaId:state.id,ticketId,revision,role,seat:seat.kind,agent:seat.agent,cwd:this.options.cwd,
       prompt:seatBrief(state,ticketId,seat),ticket:ticket??closure!,workspace};
   }
   /**
@@ -197,7 +190,7 @@ export class RoundtableController {
    * without Main. A seat is one-shot per revision: once a role has been seated at a revision it is never seated
    * there again, so a seat that ended without a handoff waits for its escalation instead of being replaced.
    * A seat also waits for any live seat of its own role (a superseded revision ends at its next tool boundary);
-   * an Owner waits for every seat of its ticket, so a rework fork copies a complete, flushed transcript and owns
+   * a work seat waits for every seat of its ticket, so a rework fork copies a complete, flushed transcript and owns
    * the checkout alone.
    */
   private async relay():Promise<Result<SeatHandle[],RuntimeError>> {
@@ -208,7 +201,8 @@ export class RoundtableController {
       if(!ticket.started)continue;
       for(const role of availableRoles(this.state,ticket)){
         if(host.seated(ticket.id,role,ticket.revision))continue;
-        if(role===OWNER?!ticketRoles.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
+        const working=ticketDefinition(this.state.workflow,ticket)?.kind==='work';
+        if(working?!ticketRoles.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
       }
     }
     const closure=this.state.closure;

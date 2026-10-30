@@ -123,7 +123,7 @@ export function createHostPort(options:HostOptions):HostPort {
         await mkdir(sessionDir,{recursive:true,mode:0o700});
         let workspace:string;
         if(input.workspace.kind==='fork'){
-          if(input.role!=='owner')throw new Error('Gate sessions must never inherit history');
+          if(input.seat!=='work')throw new Error('Judge sessions must never inherit history');
           const prior=await SessionManager.peekSessionInit(input.workspace.sessionFile);
           if(!prior)throw new Error('Owner fork source has no native session contract');
           workspace=prior.cwd;
@@ -158,7 +158,7 @@ export function createHostPort(options:HostOptions):HostPort {
               const response=await options.execute(caller,parsed.value.input);
               if(response.ok&&['submit','verdict','escalate'].includes(parsed.value.input.op)){
                 handedOff=true;
-                if(input.role==='owner'&&'ticket' in response.value&&'ownerSessionFile' in response.value.ticket){
+                if(input.seat==='work'&&'ticket' in response.value&&'sessions' in response.value.ticket){
                   nativeManager.appendCustomEntry('roundtable-handoff',{ticketId:input.ticketId,notes:response.value.ticket.notes.length,rulings:response.value.ticket.rulings.length});
                 }
               }
@@ -223,13 +223,13 @@ export function createHostPort(options:HostOptions):HostPort {
         }else{
           // The base prompt (before any per-turn extension rewrite) and tool presentation a rework fork restores for an identical prefix.
           manager.appendCustomEntry('roundtable-session-contract',{systemPrompt:created.session.systemPrompt,tools,mountedTools:created.session.getMountedXdevToolNames()});
-          manager.appendSessionInit({systemPrompt:created.session.systemPrompt,task:input.prompt,tools,agent:agent.name,readOnly:input.role!=='owner',spawns});
+          manager.appendSessionInit({systemPrompt:created.session.systemPrompt,task:input.prompt,tools,agent:agent.name,readOnly:input.seat!=='work',spawns});
         }
         const prompt=fork&&handoff?.success
           ? `Continue ticket ${input.ticketId} at revision ${input.revision}. Only the incremental handoff follows. Call roundtable read if the current contract or PR is needed.\n${JSON.stringify({notes:input.ticket.notes.slice(handoff.data.notes),rulings:input.ticket.rulings.slice(handoff.data.rulings)})}`
           : input.prompt;
-        // The Owner's checkout outlives the seat for rework forks until finish; a gate checkout ends with its seat.
-        const session=created.session,disposable=input.role==='owner'?null:tree;
+        // A work seat's checkout outlives the seat for rework forks until finish; a judge checkout ends with its seat.
+        const session=created.session,disposable=input.seat==='work'?null:tree;
         // Like native terminal-yield handling, abort the obsolete tool loop at a
         // tool-completion boundary. Accepted handoffs have already saved their
         // checkpoint and must finish normally, even if their transition bumped revision.

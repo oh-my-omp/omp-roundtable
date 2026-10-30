@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { z } from '@oh-my-pi/omptype/zod';
 import { agendaIdSchema } from '../domain/model.ts';
 import type { Agenda, AgendaId, Result } from '../domain/model.ts';
-import { parseAgenda } from '../domain/parse.ts';
+import { encodeAgenda, parseAgenda } from '../domain/parse.ts';
 import type { AgendaFiles, FileMetrics, StateError } from './contracts.ts';
 
 const envelopeSchema = z.object({
@@ -30,7 +30,7 @@ function decode(contents: string, id: AgendaId): StateResult<Agenda> {
     return failure('corruptState', `Agenda ${id}: invalid JSON`);
   }
   if (typeof value === 'object' && value !== null && 'format' in value
-    && typeof value.format === 'number' && Number.isInteger(value.format) && value.format !== 6) {
+    && typeof value.format === 'number' && Number.isInteger(value.format) && value.format !== 7) {
     return failure('unsupportedFormat', `Agenda ${id}: unsupported format ${value.format}`);
   }
   const parsed = envelopeSchema.safeParse(value);
@@ -99,7 +99,9 @@ export function createAgendaFiles(dataDir: string, metrics?: FileMetrics): Agend
   }
 
   async function save(expectedVersion: number | null, supplied: Agenda): Promise<StateResult<null>> {
-    const parsed = parseAgenda(supplied);
+    // Round-trip through the persisted form, so only a state that loads back exactly is ever written.
+    const encoded = encodeAgenda(supplied);
+    const parsed = parseAgenda(encoded);
     if (!parsed.ok) return failure('corruptState', `${parsed.error.path}: ${parsed.error.reason}`);
     if (expectedVersion !== null && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) {
       return failure('versionConflict', 'Expected version must be a positive integer or null');
@@ -107,7 +109,7 @@ export function createAgendaFiles(dataDir: string, metrics?: FileMetrics): Agend
     const state = parsed.value;
     const target = join(directory, `${state.id}.json`);
     // Capture the complete target once, before any I/O. Retrying never recomputes a transition.
-    const contents = `${JSON.stringify({ format: 6, state })}\n`;
+    const contents = `${JSON.stringify({ format: 7, state: encoded })}\n`;
     const previous = await load(state.id);
     if (!previous.ok && previous.error.kind !== 'notFound') return previous;
 

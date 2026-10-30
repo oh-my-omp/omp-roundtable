@@ -7,9 +7,10 @@
 
 import {closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {join, resolve} from 'node:path';
-import type {Subprocess} from 'bun';
+import {YAML, type Subprocess} from 'bun';
 import {z} from '@oh-my-pi/omptype/zod';
-import {JUDGE_STAGES, type Agenda, type Workflow} from '../../src/domain/model.ts';
+import type {Agenda} from '../../src/domain/model.ts';
+import {encodeWorkflow, parseWorkflow, parentSeatRoles, workflowAgents, type ParentState, type TicketState, type Workflow} from '../../src/domain/workflow.ts';
 import {createAgendaFiles} from '../../src/ports/state.ts';
 import {git, remotePath, seedGitHub, withState, type SimState} from './github-sim.ts';
 import type {Expect, Scenario, TicketSpec} from './scenario.ts';
@@ -19,10 +20,29 @@ const REPO = {owner: 'sim', name: 'arena'};
 const KEY = `${REPO.owner}/${REPO.name}`;
 const DEADLINE_MS = 240_000;
 
-const judge = (role: string, agent = 'sim-seat') => ({role, agent, brief: `Judge as the ${role} seat.`});
-/** The built-in roster with every seat played by the scripted `sim-seat` agent. */
-const SIM_WORKFLOW: Workflow = {owner: {agent: 'sim-seat', brief: 'Deliver the ticket.'},
-  judges: {pullRequest: [judge('review'), judge('accept')], mergeCommit: [judge('postMerge')], parent: [judge('closure')]}};
+/** Parse a file-shaped workflow fixture; a fixture the parser refuses is a broken simulation. */
+function workflowOf(source: unknown): Workflow {
+  const parsed = parseWorkflow(source);
+  if (!parsed.ok) throw new Error(`Invalid sim workflow at ${parsed.error.path}: ${parsed.error.reason}`);
+  return parsed.value;
+}
+/** Every seat of `workflow` played by one scripted agent. */
+function playedBy(workflow: Workflow, agent: string): Workflow {
+  const seat = <S extends TicketState | ParentState>(state: S): S =>
+    state.kind === 'work' ? {...state, agent} : state.kind === 'judge' ? {...state, judges: state.judges.map(item => ({...item, agent}))} : state;
+  return {ticket: {...workflow.ticket, states: Object.fromEntries(Object.entries(workflow.ticket.states).map(([key, state]) => [key, seat(state)]))},
+    parent: {...workflow.parent, states: Object.fromEntries(Object.entries(workflow.parent.states).map(([key, state]) => [key, seat(state)]))}};
+}
+/** The built-in workflow with every seat played by the scripted `sim-seat` agent. */
+const SIM_WORKFLOW = playedBy(workflowOf(YAML.parse(readFileSync(join(ROOT, 'src/default-workflow.yml'), 'utf8'))), 'sim-seat');
+/** The subject each judge role of `workflow` judges. */
+function judgeSubjects(workflow: Workflow): Map<string, 'pullRequest' | 'mergeCommit' | 'parent'> {
+  const subjects = new Map<string, 'pullRequest' | 'mergeCommit' | 'parent'>();
+  for (const state of Object.values(workflow.ticket.states)) if (state.kind === 'judge') for (const item of state.judges) subjects.set(item.role, state.subject);
+  for (const role of parentSeatRoles(workflow)) subjects.set(role, 'parent');
+  return subjects;
+}
+const workRoles = (workflow: Workflow) => [...new Set(Object.values(workflow.ticket.states).flatMap(state => state.kind === 'work' ? [state.role] : []))];
 
 type Run = {
   name: string; dir: string; github: string; bin: string; work: string; data: string; mainSessions: string;
@@ -37,7 +57,7 @@ type Case = {
   issues: {title: string; children?: number[]}[];
   requiredChecks: string[];
   ci: {default: SimState['ciDefault']; failMarker: string | null};
-  scenario: (markers: string) => Omit<Scenario, 'log' | 'repo' | 'name' | 'parentRoles'>;
+  scenario: (markers: string) => Omit<Scenario, 'log' | 'repo' | 'name' | 'parentRoles' | 'workRoles'>;
   rootIssue: number;
   drive?: (run: Run) => Promise<void>;
   check: (run: Run) => Promise<string[]>;
@@ -54,10 +74,10 @@ function setup(spec: Case): Run {
     issues: spec.issues.map(issue => ({repo: KEY, title: issue.title, body: `Simulated ${issue.title}.`, ...(issue.children ? {children: issue.children} : {})}))});
   const workflow = spec.workflow ?? SIM_WORKFLOW;
   // Every agent the workflow names is a scripted seat; the data directory's workflow.yml is the override convene reads (JSON is YAML).
-  for (const agent of new Set([workflow.owner.agent, ...JUDGE_STAGES.flatMap(stage => workflow.judges[stage].map(item => item.agent))]))
+  for (const agent of workflowAgents(workflow))
     writeFileSync(join(work, '.omp', 'agents', `${agent}.md`), `---\nname: ${agent}\ndescription: Scripted roundtable seat for the state-flow simulation\nmodel: sim/seat\n---\n\nFollow the roundtable brief.\n`);
-  writeFileSync(join(data, 'workflow.yml'), JSON.stringify(workflow, null, 1));
-  const scenario: Scenario = {name: spec.name, repo: REPO, log: join(dir, 'model.jsonl'), parentRoles: workflow.judges.parent.map(item => item.role), ...spec.scenario(markers)};
+  writeFileSync(join(data, 'workflow.yml'), JSON.stringify(encodeWorkflow(workflow), null, 1));
+  const scenario: Scenario = {name: spec.name, repo: REPO, log: join(dir, 'model.jsonl'), parentRoles: parentSeatRoles(workflow), workRoles: workRoles(workflow), ...spec.scenario(markers)};
   const scenarioFile = join(dir, 'scenario.json');
   writeFileSync(scenarioFile, JSON.stringify(scenario, null, 1));
   writeFileSync(scenario.log, '');
@@ -173,7 +193,8 @@ const gitIn = (run: Run, args: string[]) => git(remotePath(run.github, KEY), arg
 
 /* ------------------------------------------------------------ shared checks */
 
-async function commonChecks(run: Run, expectOnMain: Expect): Promise<string[]> {
+/** `expected` names the judge roles whose accepted verdict each ticket must show; by default every ticket judge. */
+async function commonChecks(run: Run, expectOnMain: Expect, expected?: Record<string, string[]>): Promise<string[]> {
   const failures: string[] = [];
   const state = await agenda(run);
   if (!completed(state)) failures.push(`agenda is ${state?.lifecycle ?? 'missing'}, not completed`);
@@ -202,24 +223,25 @@ async function commonChecks(run: Run, expectOnMain: Expect): Promise<string[]> {
       if (input?.op === 'resolve' && input.ticketId) resolved.add(`${input.ticketId}:${input.revision}`);
     }
   }
-  // Judges judged the exact commit their stage names: pullRequest judges a PR commit, mergeCommit the merge commit, parent main.
+  // Judges judged the exact commit their subject names: pullRequest a PR commit, mergeCommit the merge commit, parent main.
   const sim = simState(run);
   const verdicts = acceptedVerdicts(seatSessions(run, state?.id ?? ''));
-  const roles = (stage: typeof JUDGE_STAGES[number]) => run.workflow.judges[stage].map(item => item.role);
+  const subjects = judgeSubjects(run.workflow);
+  const ticketJudges = [...subjects].filter(([, subject]) => subject !== 'parent').map(([role]) => role);
   for (const ticket of run.scenario.tickets.filter(item => Object.keys(item.gate).length > 0))
-    for (const role of [...roles('pullRequest'), ...roles('mergeCommit')]) if (!verdicts.some(verdict => verdict.ticket === ticket.id && verdict.role === role)) failures.push(`${ticket.id} has no accepted ${role} verdict in its transcripts`);
-  if (run.scenario.parent !== null) for (const role of roles('parent')) if (!verdicts.some(verdict => verdict.role === role)) failures.push(`no accepted ${role} closure verdict in the transcripts`);
+    for (const role of expected?.[ticket.id] ?? ticketJudges) if (!verdicts.some(verdict => verdict.ticket === ticket.id && verdict.role === role)) failures.push(`${ticket.id} has no accepted ${role} verdict in its transcripts`);
+  if (run.scenario.parent !== null) for (const role of parentSeatRoles(run.workflow)) if (!verdicts.some(verdict => verdict.role === role)) failures.push(`no accepted ${role} closure verdict in the transcripts`);
   for (const verdict of verdicts) {
     const head = /HEAD ([0-9a-f]{40})/.exec(verdict.note)?.[1];
     if (!head) { failures.push(`${verdict.ticket} ${verdict.role} verdict has no observed HEAD`); continue; }
-    if (roles('parent').includes(verdict.role)) {
+    if (subjects.get(verdict.role) === 'parent') {
       if (gitIn(run, ['merge-base', '--is-ancestor', head, 'main']).code !== 0) failures.push(`${verdict.role} sat on ${head}, which is not on main`);
       continue;
     }
     const spec = run.scenario.tickets.find(ticket => ticket.id === verdict.ticket);
     const pr = sim.prs.find(item => item.state === 'MERGED' && spec && item.body.includes(`#${spec.issue}`));
     if (!pr?.mergeCommit) { failures.push(`${verdict.ticket} has no merged PR`); continue; }
-    if (roles('mergeCommit').includes(verdict.role)) {
+    if (subjects.get(verdict.role) === 'mergeCommit') {
       if (head !== pr.mergeCommit) failures.push(`${verdict.ticket} ${verdict.role} sat on ${head}, not merge ${pr.mergeCommit}`);
     } else if (gitIn(run, ['merge-base', '--is-ancestor', head, pr.lastHead]).code !== 0 || gitIn(run, ['merge-base', '--is-ancestor', head, `${pr.mergeCommit}^1`]).code === 0) {
       failures.push(`${verdict.ticket} ${verdict.role} sat on ${head}, which is not a commit of its PR`);
@@ -233,8 +255,8 @@ async function commonChecks(run: Run, expectOnMain: Expect): Promise<string[]> {
   return failures;
 }
 
-function owners(sessions: SeatSession[], ticket: string): SeatSession[] {
-  return sessions.filter(session => session.role === 'owner' && session.ticket === ticket);
+function owners(sessions: SeatSession[], ticket: string, role = 'owner'): SeatSession[] {
+  return sessions.filter(session => session.role === role && session.ticket === ticket);
 }
 
 /* ------------------------------------------------------------ scenarios */
@@ -261,7 +283,7 @@ const cases: Case[] = [
       ticket('D', 7, [{kind: 'escalate', escalation: 'blocked', reason: 'Clauses demand d.txt=1 and d.txt=2.'}, commit({'d.txt': '1\n'})], {'d.txt': '1\n'},
         {rulings: [{to: 'Coding', ruling: 'Clause 1 governs: d.txt must be 1.'}]}),
       ticket('E', 8, [{kind: 'escalate', escalation: 'noCode', reason: 'e.txt is already 1.'}], {},
-        {rulings: [{to: 'Done', ruling: 'e.txt already satisfies the contract.', noCode: 'e.txt is already 1 on main.'}]}),
+        {rulings: [{to: 'Closing', ruling: 'e.txt already satisfies the contract.', noCode: 'e.txt is already 1 on main.'}]}),
     ]}),
     async check(run) {
       const failures = await commonChecks(run, TREE_DONE);
@@ -320,7 +342,7 @@ const cases: Case[] = [
     async check(run) {
       const failures = await commonChecks(run, {'p.txt': '1\n', 'f.txt': '1\n'});
       const flips = z.array(z.object({sha: z.string(), at: z.number()})).parse(JSON.parse(readFileSync(join(run.dir, 'ci-flips.json'), 'utf8')));
-      for (const entry of modelLog(run).filter(item => item.kind === 'seat' && run.workflow.judges.pullRequest.some(judge => judge.role === item.role) && item.note === 'inspect')) {
+      for (const entry of modelLog(run).filter(item => item.kind === 'seat' && item.role !== undefined && judgeSubjects(run.workflow).get(item.role) === 'pullRequest' && item.note === 'inspect')) {
         const flipped = flips.filter(flip => flip.at <= entry.at);
         if (!flipped.length) failures.push(`${entry.ticket} ${entry.role} started before any required check passed`);
       }
@@ -398,8 +420,10 @@ const cases: Case[] = [
         return ticket?.state === 'Coding' && ticket.revision >= 2 && modelLog(run).some(entry => entry.ticket === 'K' && entry.role === 'owner' && entry.note.startsWith('round 0 step 2'));
       });
       await kill(run);
-      // The resumed agenda keeps the roster it was convened with; a different file only shapes the next convene.
-      writeFileSync(join(run.data, 'workflow.yml'), JSON.stringify({...SIM_WORKFLOW, judges: {pullRequest: [judge('audit')], mergeCommit: [], parent: []}}));
+      // The resumed agenda keeps the workflow it was convened with; a different file only shapes the next convene.
+      const reviewing = SIM_WORKFLOW.ticket.states.Reviewing!;
+      const audited: Workflow = {...SIM_WORKFLOW, ticket: {...SIM_WORKFLOW.ticket, states: {...SIM_WORKFLOW.ticket.states, Reviewing: {...reviewing, kind: 'judge', judges: [{role: 'audit', agent: 'sim-seat', brief: 'Audit the PR.'}]} as TicketState}}};
+      writeFileSync(join(run.data, 'workflow.yml'), JSON.stringify(encodeWorkflow(audited)));
       start(run);
       await waitUntil(run, 'completion after resume', completed);
     },
@@ -409,7 +433,7 @@ const cases: Case[] = [
       const state = await agenda(run);
       const sessions = seatSessions(run, state!.id);
       if (sessions.some(session => session.role === 'audit')) failures.push('the resumed agenda seated a role from the rewritten workflow file');
-      if (JSON.stringify(state?.workflow) !== JSON.stringify(SIM_WORKFLOW)) failures.push(`the agenda workflow changed after resume: ${JSON.stringify(state?.workflow)}`);
+      if (!Bun.deepEquals(state?.workflow, SIM_WORKFLOW, true)) failures.push(`the agenda workflow changed after resume: ${JSON.stringify(state?.workflow)}`);
       const [source, fork] = owners(sessions, 'K');
       if (!source || !fork || fork.parent !== source.id) return [...failures, 'K rework Owner is not a fork of the interrupted Owner'];
       const message = (line: SeatSession['lines'][number]) => z.object({message: z.object({role: z.string(), content: z.unknown(), toolCallId: z.string().optional(), usage: z.object({cost: z.object({total: z.number()})}).optional()}).passthrough()}).safeParse(line);
@@ -428,52 +452,76 @@ const cases: Case[] = [
     },
   },
   {
-    name: 'roster',
-    // Non-default seat names, a distinct agent and duty per seat, two PR judges, no merge-commit judge, two parent judges.
-    workflow: {owner: {agent: 'sim-owner', brief: 'OWNER-DUTY deliver the ticket.'}, judges: {
-      pullRequest: [{role: 'quality', agent: 'sim-quality', brief: 'QUALITY-DUTY judge the PR.'}, {role: 'security', agent: 'sim-security', brief: 'SECURITY-DUTY judge the PR.'}],
-      mergeCommit: [],
-      parent: [{role: 'release', agent: 'sim-release', brief: 'RELEASE-DUTY judge the parent.'}, {role: 'compliance', agent: 'sim-compliance', brief: 'COMPLIANCE-DUTY judge the parent.'}]}},
-    files: {'r1.txt': '0\n', 'r2.txt': '0\n'},
-    issues: [{title: 'Parent', children: [2, 3]}, {title: 'R1'}, {title: 'R2'}],
+    name: 'flow',
+    // A workflow unlike the built-in one: renamed and added states, a security judge skipped on rework by an entry guard,
+    // a security rejection routed to Main instead of rework, a post-merge judge only on a conditional branch, and its own parent machine.
+    workflow: workflowOf({
+      ticket: {initial: 'Build', adopted: {pullRequest: 'WaitCi', mergeCommit: 'Close'}, states: {
+        Build: {kind: 'work', role: 'builder', agent: 'sim-builder', brief: 'BUILD-DUTY deliver the ticket.', on: {submitted: 'Open', escalated: 'escalate'}},
+        Open: {kind: 'action', action: 'publishPr', on: {done: 'WaitCi'}},
+        WaitCi: {kind: 'decision', branches: [{when: {all: [{checks: 'passing'}, {mergeable: 'yes'}]}, to: 'Security'}],
+          observe: {checksFailed: 'Build', conflict: 'Build', behind: 'Build', drift: 'WaitCi'}},
+        Security: {kind: 'judge', subject: 'pullRequest', when: {not: {visits: {state: 'Build', atLeast: 2}}}, otherwise: 'Quality',
+          judges: [{role: 'security', agent: 'sim-security', brief: 'SECURITY-DUTY judge the PR.'}],
+          observe: {checksFailed: 'Build', conflict: 'Build', behind: 'Build', drift: 'WaitCi'}, on: {passed: 'Quality', rejected: 'escalate', escalated: 'escalate'}},
+        Quality: {kind: 'judge', subject: 'pullRequest', judges: [{role: 'quality', agent: 'sim-quality', brief: 'QUALITY-DUTY judge the PR.'}],
+          observe: {checksFailed: 'Build', conflict: 'Build', behind: 'Build', drift: 'WaitCi'}, on: {passed: 'Ship', rejected: 'Build', escalated: 'escalate'}},
+        Ship: {kind: 'action', action: 'merge', requires: ['Quality'], observe: {checksFailed: 'Build', conflict: 'Build', behind: 'Build'},
+          on: {done: [{when: {visits: {state: 'Build', atLeast: 2}}, to: 'Deploy'}, {to: 'Close'}]}},
+        Deploy: {kind: 'judge', subject: 'mergeCommit', judges: [{role: 'deploy', agent: 'sim-deploy', brief: 'DEPLOY-DUTY verify the merge.'}], on: {passed: 'Close', rejected: 'escalate', escalated: 'escalate'}},
+        Close: {kind: 'action', action: 'closeIssue', on: {done: 'Delivered'}},
+        Delivered: {kind: 'final'},
+      }},
+      parent: {initial: 'Release', states: {
+        Release: {kind: 'judge', judges: [{role: 'release', agent: 'sim-release', brief: 'RELEASE-DUTY judge the parent.'}, {role: 'compliance', agent: 'sim-compliance', brief: 'COMPLIANCE-DUTY judge the parent.'}],
+          on: {passed: 'CloseParent', rejected: 'escalate', escalated: 'escalate'}},
+        CloseParent: {kind: 'action', action: 'closeParent', requires: ['Release'], on: {done: 'Finished'}},
+        Finished: {kind: 'final'},
+      }},
+    }),
+    files: {'f1.txt': '0\n', 'f2.txt': '0\n', 'f3.txt': '0\n'},
+    issues: [{title: 'Parent', children: [2, 3, 4]}, {title: 'F1'}, {title: 'F2'}, {title: 'F3'}],
     requiredChecks: [], ci: {default: 'SUCCESS', failMarker: null}, rootIssue: 1,
-    scenario: markers => ({parent: 1, closure: {'r1.txt': '1\n', 'r2.txt': '1\n'}, tickets: [
-      ticket('R1', 2, [commit({'r1.txt': '1\n'})], {'r1.txt': '1\n'}, {hold: {roles: ['security'], marker: join(markers, 'release-security')}}),
-      ticket('R2', 3, [commit({'r2.txt': '1\n'})], {'r2.txt': '1\n'}),
+    scenario: () => ({parent: 1, closure: {'f1.txt': '1\n', 'f2.txt': '1\n', 'f2.verify': '1\n', 'f3.txt': '1\n'}, tickets: [
+      // Passes first time: Security, Quality, then straight to Close.
+      ticket('F1', 2, [commit({'f1.txt': '1\n'})], {'f1.txt': '1\n'}),
+      // Security accepts round one; Quality demands f2.verify, so the builder reworks and Security is skipped the second time.
+      ticket('F2', 3, [commit({'f2.txt': '1\n'}), commit({'f2.verify': '1\n'})], {'f2.txt': '1\n', 'f2.verify': '1\n'}, {judgeExpect: {security: {'f2.txt': '1\n'}}}),
+      // Security rejects round one, which this workflow routes to Main rather than back to Build.
+      ticket('F3', 4, [commit({'f3.txt': 'bad\n'}), commit({'f3.txt': '1\n'})], {'f3.txt': '1\n'}, {rulings: [{to: 'Build', ruling: 'The security finding stands: f3.txt must be 1.'}]}),
     ]}),
-    async drive(run) {
-      // While security still holds, quality's pass alone must not let R1 merge.
-      await waitUntil(run, 'R1 quality passed while security holds', state => ticketOf(state, 'R1')?.gates.pullRequest?.verdicts.some(verdict => verdict.role === 'quality' && verdict.status === 'passed') ?? false);
-      const held = ticketOf(await agenda(run), 'R1');
-      const merged = simState(run).prs.some(pr => pr.state === 'MERGED' && pr.body.includes('#2'));
-      writeFileSync(join(run.dir, 'held.json'), JSON.stringify({state: held?.state, verdicts: held?.gates.pullRequest?.verdicts, merged}));
-      writeFileSync(join(run.dir, 'markers', 'release-security'), '');
-      await waitUntil(run, 'completion', completed);
-    },
     async check(run) {
-      const failures = await commonChecks(run, {'r1.txt': '1\n', 'r2.txt': '1\n'});
-      const held = z.object({state: z.string().optional(), verdicts: z.array(z.object({role: z.string(), status: z.string()})).optional(), merged: z.boolean()}).parse(JSON.parse(readFileSync(join(run.dir, 'held.json'), 'utf8')));
-      if (held.state !== 'Reviewing' || held.merged || held.verdicts?.find(verdict => verdict.role === 'security')?.status !== 'pending') failures.push(`R1 advanced on one of two PR judges: ${JSON.stringify(held)}`);
+      const failures = await commonChecks(run, {'f1.txt': '1\n', 'f2.txt': '1\n', 'f2.verify': '1\n', 'f3.txt': '1\n'},
+        {F1: ['security', 'quality'], F2: ['security', 'quality', 'deploy'], F3: ['security', 'quality', 'deploy']});
       const state = await agenda(run);
-      const seats: Record<string, {agent: string; duty: string}> = {owner: {agent: 'sim-owner', duty: 'OWNER-DUTY'}, quality: {agent: 'sim-quality', duty: 'QUALITY-DUTY'},
-        security: {agent: 'sim-security', duty: 'SECURITY-DUTY'}, release: {agent: 'sim-release', duty: 'RELEASE-DUTY'}, compliance: {agent: 'sim-compliance', duty: 'COMPLIANCE-DUTY'}};
       const sessions = seatSessions(run, state!.id);
-      for (const role of Object.keys(seats)) if (!sessions.some(session => session.role === role)) failures.push(`no ${role} seat ran`);
+      const visits = (id: string) => ticketOf(state, id)?.visits ?? {};
+      const seats = (id: string, role: string) => sessions.filter(session => session.ticket === id && session.role === role).length;
+      for (const id of ['F1', 'F2', 'F3']) if (ticketOf(state, id)?.state !== 'Delivered') failures.push(`${id} ended in ${ticketOf(state, id)?.state}, not Delivered`);
+      // Entry guard: Security is entered once per ticket; the rework passes straight to Quality.
+      for (const id of ['F2', 'F3']) if (visits(id).Security !== 1 || seats(id, 'security') !== 1) failures.push(`${id} entered Security ${visits(id).Security} times with ${seats(id, 'security')} seats, not once`);
+      if (visits('F2').Quality !== 2 || seats('F2', 'quality') !== 2) failures.push(`F2 entered Quality ${visits('F2').Quality} times, not twice`);
+      // Rerouted failure: F3's security rejection went to Main, and only Main's ruling returned it to Build.
+      const f3 = ticketOf(state, 'F3');
+      const finding = f3?.notes.findIndex(item => item.kind === 'finding' && item.author.kind === 'seat' && item.author.role === 'security') ?? -1;
+      if (finding < 0 || f3?.notes[finding + 1]?.text !== 'The workflow routed this ticket to Main.' || f3.notes[finding + 2]?.kind !== 'ruling') failures.push(`F3 security rejection did not go straight to Main: ${JSON.stringify(f3?.notes)}`);
+      if (!modelLog(run).some(entry => entry.kind === 'main' && entry.note.includes('escalated:F3:'))) failures.push('Main was not woken for F3');
+      // Conditional branch after merge: only reworked tickets pass through Deploy.
+      if (visits('F1').Deploy !== undefined || seats('F1', 'deploy') !== 0) failures.push('F1 passed Deploy although it was never reworked');
+      for (const id of ['F2', 'F3']) if (visits(id).Deploy !== 1) failures.push(`${id} did not pass Deploy after its rework`);
+      // Each seat ran its own agent and carried only its own duty.
+      const duties: Record<string, {agent: string; duty: string}> = {builder: {agent: 'sim-builder', duty: 'BUILD-DUTY'}, security: {agent: 'sim-security', duty: 'SECURITY-DUTY'}, quality: {agent: 'sim-quality', duty: 'QUALITY-DUTY'},
+        deploy: {agent: 'sim-deploy', duty: 'DEPLOY-DUTY'}, release: {agent: 'sim-release', duty: 'RELEASE-DUTY'}, compliance: {agent: 'sim-compliance', duty: 'COMPLIANCE-DUTY'}};
       for (const session of sessions) {
-        const seat = seats[session.role];
+        const seat = duties[session.role];
         if (!seat) { failures.push(`${session.ticket} seated unconfigured role ${session.role}`); continue; }
         const init = session.lines.find(line => line.type === 'session_init');
         if (init?.agent !== seat.agent) failures.push(`${session.ticket} ${session.role} ran agent ${JSON.stringify(init?.agent)}, not ${seat.agent}`);
         const raw = JSON.stringify(session.lines);
-        for (const [role, other] of Object.entries(seats)) if (raw.includes(other.duty) !== (role === session.role)) failures.push(`${session.ticket} ${session.role} brief ${role === session.role ? 'lacks its' : 'carries the'} ${other.duty}`);
-      }
-      // Without merge-commit judges each ticket still passes Verifying: its stage opened on the merge commit with no verdicts.
-      for (const id of ['R1', 'R2']) {
-        const ticket = ticketOf(state, id);
-        if (ticket?.state !== 'Done' || ticket.terminal?.kind !== 'merged' || ticket.gates.mergeCommit?.verdicts.length !== 0) failures.push(`${id} did not finish through an empty mergeCommit stage: ${JSON.stringify({state: ticket?.state, terminal: ticket?.terminal, mergeCommit: ticket?.gates.mergeCommit})}`);
+        for (const [role, other] of Object.entries(duties)) if (raw.includes(other.duty) !== (role === session.role)) failures.push(`${session.ticket} ${session.role} brief ${role === session.role ? 'lacks its' : 'carries the'} ${other.duty}`);
       }
       const closure = state?.closure;
-      if (closure?.state !== 'Done' || closure.gate.verdicts.map(verdict => `${verdict.role}:${verdict.status}`).join(',') !== 'release:passed,compliance:passed') failures.push(`closure did not pass both parent judges: ${JSON.stringify(closure)}`);
+      if (closure?.state !== 'Finished' || closure.gates.Release?.verdicts.map(item => `${item.role}:${item.status}`).join(',') !== 'release:passed,compliance:passed') failures.push(`the parent machine did not finish through both Release judges: ${JSON.stringify(closure)}`);
       return failures;
     },
   },

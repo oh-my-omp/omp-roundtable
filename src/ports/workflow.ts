@@ -2,7 +2,7 @@ import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {YAML} from 'bun';
 import type {Result,Workflow} from '../domain/model.ts';
-import {parseWorkflow} from '../domain/parse.ts';
+import {parseWorkflow} from '../domain/workflow.ts';
 import type {WorkflowError} from './contracts.ts';
 
 /** Where the next agenda's workflow comes from: a configured file, or the data directory's optional override. */

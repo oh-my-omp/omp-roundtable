@@ -1,6 +1,7 @@
 import type {ZodLikeSchema} from '@oh-my-pi/omptype/zod';
-import {agendaSchema,toolParametersSchema,workflowSchema,type Agenda,type ParseError,type Result,type ToolParameters,type Workflow} from './model.ts';
-import {validateWorkflow,verdictsMatch} from './workflow.ts';
+import {agendaSchema,toolParametersSchema,type Agenda,type ParseError,type Result,type ToolParameters} from './model.ts';
+import {ESCALATED,encodeWorkflow,parseWorkflow,verdictsMatch} from './workflow.ts';
+import {sameRef} from './identity.ts';
 
 function parse<T>(schema:ZodLikeSchema<T>,value:unknown):Result<T,ParseError> {
   const parsed=schema.safeParse(value);
@@ -9,11 +10,6 @@ function parse<T>(schema:ZodLikeSchema<T>,value:unknown):Result<T,ParseError> {
   return {ok:false,error:{path:first?.path.join('.')??'',reason:first?.message??'Invalid input'}};
 }
 export function parseToolParameters(value:unknown):Result<ToolParameters,ParseError>{return parse(toolParametersSchema,value);}
-export function parseWorkflow(value:unknown):Result<Workflow,ParseError> {
-  const parsed=parse(workflowSchema,value);if(!parsed.ok)return parsed;
-  const invalid=validateWorkflow(parsed.value);
-  return invalid?{ok:false,error:{path:'judges',reason:invalid}}:parsed;
-}
 
 /** Validate graph integrity at the file/input boundary, not at each internal read. */
 export function validateTopology(state:Pick<Agenda,'tickets'>):string|null {
@@ -38,18 +34,44 @@ export function validateTopology(state:Pick<Agenda,'tickets'>):string|null {
   for(const ticket of state.tickets)if(!visit(ticket.id))return 'Ticket dependencies must be acyclic';
   return null;
 }
+/** The persisted form of an agenda: its frozen workflow in file shape. */
+export function encodeAgenda(agenda:Agenda):unknown {return {...agenda,workflow:encodeWorkflow(agenda.workflow)};}
+/** Decode a persisted agenda; every recorded state, gate and session must belong to the workflow frozen in it. */
 export function parseAgenda(value:unknown):Result<Agenda,ParseError> {
   const parsed=parse(agendaSchema,value);if(!parsed.ok)return parsed;
-  const topology=validateTopology(parsed.value);
+  const workflow=parseWorkflow(parsed.value.workflow);
+  if(!workflow.ok)return {ok:false,error:{path:`workflow.${workflow.error.path}`,reason:workflow.error.reason}};
+  const agenda:Agenda={...parsed.value,workflow:workflow.value};
+  const topology=validateTopology(agenda);
   if(topology)return {ok:false,error:{path:'tickets',reason:topology}};
-  const ids=new Set(parsed.value.effects.map(effect=>effect.id));
-  if(ids.size!==parsed.value.effects.length)return {ok:false,error:{path:'effects',reason:'Effect IDs must be unique'}};
-  for(const effect of parsed.value.effects)if(!parsed.value.tickets.some(ticket=>ticket.id===effect.ticketId)&&effect.ticketId!==parsed.value.closure?.id)return {ok:false,error:{path:'effects',reason:'Effect must belong to a ticket or closure'}};
-  const workflow=parsed.value.workflow,invalid=validateWorkflow(workflow);
-  if(invalid)return {ok:false,error:{path:'workflow',reason:invalid}};
-  for(const ticket of parsed.value.tickets){
-    if(ticket.gates.pullRequest&&!verdictsMatch(workflow.judges.pullRequest,ticket.gates.pullRequest.verdicts)||ticket.gates.mergeCommit&&!verdictsMatch(workflow.judges.mergeCommit,ticket.gates.mergeCommit.verdicts))return {ok:false,error:{path:'tickets',reason:`Ticket ${ticket.id} verdicts do not match the agenda workflow`}};
+  const ids=new Set(agenda.effects.map(effect=>effect.id));
+  if(ids.size!==agenda.effects.length)return {ok:false,error:{path:'effects',reason:'Effect IDs must be unique'}};
+  for(const effect of agenda.effects){
+    const ticket=agenda.tickets.some(ticket=>ticket.id===effect.ticketId),closure=effect.ticketId===agenda.closure?.id;
+    if(!ticket&&!closure)return {ok:false,error:{path:'effects',reason:'Effect must belong to a ticket or closure'}};
+    if(effect.origin&&!(effect.origin.state in (ticket?workflow.value.ticket.states:workflow.value.parent.states)))return {ok:false,error:{path:'effects',reason:`Effect ${effect.id} was requested by ${effect.origin.state}, which the agenda workflow does not define`}};
   }
-  if(parsed.value.closure&&!verdictsMatch(workflow.judges.parent,parsed.value.closure.gate.verdicts))return {ok:false,error:{path:'closure',reason:'Closure verdicts do not match the agenda workflow'}};
-  return parsed;
+  const ticketStates=workflow.value.ticket.states,parentStates=workflow.value.parent.states;
+  for(const ticket of agenda.tickets){
+    const fail=(reason:string):Result<Agenda,ParseError>=>({ok:false,error:{path:'tickets',reason:`Ticket ${ticket.id} ${reason}`}});
+    if(ticket.state!==ESCALATED&&!(ticket.state in ticketStates))return fail(`is in ${ticket.state}, which the agenda workflow does not define`);
+    for(const [name,gate] of Object.entries(ticket.gates)){
+      const state=ticketStates[name];
+      if(state?.kind!=='judge'||state.subject!==gate.stamp.kind||!verdictsMatch(state.judges,gate.verdicts))return fail(`holds a ${name} gate that does not match the agenda workflow`);
+    }
+    for(const role of Object.keys(ticket.sessions))if(!Object.values(ticketStates).some(state=>state.kind==='work'&&state.role===role))return fail(`holds a session for ${role}, which is not a work role`);
+    for(const name of Object.keys(ticket.visits))if(!(name in ticketStates))return fail(`counts visits to ${name}, which the agenda workflow does not define`);
+  }
+  const closure=agenda.closure;
+  if(closure){
+    const fail=(reason:string):Result<Agenda,ParseError>=>({ok:false,error:{path:'closure',reason:`Closure ${reason}`}});
+    if(!agenda.parent||!sameRef(closure.stamp.parent,agenda.parent))return fail('belongs to no parent of this agenda');
+    if(closure.state!==ESCALATED&&!(closure.state in parentStates))return fail(`is in ${closure.state}, which the agenda workflow does not define`);
+    for(const name of Object.keys(closure.visits))if(!(name in parentStates))return fail(`counts visits to ${name}, which the agenda workflow does not define`);
+    for(const [name,gate] of Object.entries(closure.gates)){
+      const state=parentStates[name];
+      if(state?.kind!=='judge'||!verdictsMatch(state.judges,gate.verdicts))return fail(`holds a ${name} gate that does not match the agenda workflow`);
+    }
+  }
+  return {ok:true,value:agenda};
 }

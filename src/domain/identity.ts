@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import type {Agenda,Facts,IssueRef,Repo,Result,Target,Ticket} from './model.ts';
+import type {Agenda,Facts,IssueRef,Repo,Result,Target} from './model.ts';
 
 export function canonical(value:unknown):string {
   if(value===null||typeof value!=='object')return JSON.stringify(value)??'null';
@@ -35,4 +35,3 @@ export function targetHead(facts:Facts,target:Target):string|null {
 export function contains(facts:Facts,repo:Repo,ancestor:string,descendant:string):boolean {
   return ancestor===descendant||facts.commits.some(item=>sameRepo(item.repo,repo)&&item.ancestor===ancestor&&item.descendant===descendant&&item.result==='contains');
 }
-export function dependenciesDone(state:Agenda,ticket:Ticket):boolean{return ticket.dependsOn.every(id=>state.tickets.some(item=>item.id===id&&item.state==='Done'));}
