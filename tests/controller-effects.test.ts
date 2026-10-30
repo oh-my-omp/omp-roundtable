@@ -7,13 +7,20 @@ import type {GitHubPort,HostPort} from '../src/ports/contracts.ts';
 import {createAgendaFiles} from '../src/ports/state.ts';
 import {RoundtableController} from '../src/runtime/controller.ts';
 import {bodyHash} from '../src/domain/identity.ts';
+import {YAML} from 'bun';
+import {parseWorkflow} from '../src/domain/parse.ts';
+
+const parsedWorkflow=parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text()));
+if(!parsedWorkflow.ok)throw new Error(parsedWorkflow.error.reason);
+const defaultWorkflow=parsedWorkflow.value;
+const workflow=async()=>({ok:true as const,value:defaultWorkflow});
 
 const repository={owner:'test',name:'roundtable'};
 const issue={repo:repository,number:1};
 const head='1'.repeat(40),base='2'.repeat(40);
 const facts:Facts={viewer:'test',issues:[{ref:issue,body:'Deliver the ticket.',bodyHash:bodyHash('Deliver the ticket.'),updatedAt:1,state:'open',lastClose:null,lastReopen:null,children:[]}],prs:[],links:[],repos:[{repo:repository,defaultBranch:'main',defaultHead:base,bases:[{name:'main',state:{kind:'present',head:base,isDefault:true,rules:{required:[],strict:false,constraints:[]}}}]}],branches:[{repo:repository,name:'feature',state:{kind:'present',head}}],maintenance:[],commits:[],checkAttempts:[],createdIssues:[]};
 function unexpected():never {throw new Error('Unexpected port call');}
-const host:HostPort={bind:unexpected,launch:unexpected,active:()=>false,seated:()=>false,finish:async()=>({ok:true,value:null}),dispose:async()=>{}};
+const host:HostPort={agents:async()=>({ok:true,value:null}),bind:unexpected,launch:unexpected,active:()=>false,seated:()=>false,finish:async()=>({ok:true,value:null}),dispose:async()=>{}};
 function success<T>(value:T):Result<T,PortError>{return {ok:true,value};}
 
 for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operation} is durable before dispatch and is not resent on refresh or resume`,async()=>{
@@ -37,7 +44,7 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     createPr:operation==='publishPr'?unknownWrite:unexpected,mergePr:operation==='merge'?unknownWrite:unexpected,
   };
   const errors:unknown[]=[];
-  controller=new RoundtableController({files,github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
+  controller=new RoundtableController({files,github,host,cwd:root,workflow,intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
   const main:Caller={kind:'main',agentId:'Main',sessionId:'first-main',sessionFile:null};controller.setMain(main);
   try {
     const convened=await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:operation==='merge'?prRef:null}]});
@@ -64,7 +71,7 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     expect(failed.tickets[0]?.state).toBe('Escalated');
     if(operation==='publishPr')expect(failed.tickets[0]?.ownerSessionFile).toBe(owner.sessionFile);
     await controller.shutdown();
-    controller=new RoundtableController({files,github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
+    controller=new RoundtableController({files,github,host,cwd:root,workflow:async()=>{throw new Error('Resume must use the frozen workflow');},intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
     const successor:Caller={kind:'main',agentId:'Main',sessionId:'second-main',sessionFile:null};controller.setMain(successor);
     expect((await controller.execute(successor,{op:'resume',agenda:failed.id,operatorConfirmedOriginalSessionEnded:true})).ok).toBe(true);
     await controller.run();await controller.run();
@@ -86,7 +93,7 @@ test('Main can adopt a source-confirmed external merge below the target head in 
     contains:async(_repo,ancestor,descendant)=>{comparisons.push(`${ancestor}:${descendant}`);return success('contains');},
     openPrsByHead:async()=>success([]),branchHead:unexpected,issue:unexpected,pr:unexpected,issuesCreatedSince:unexpected,checkAttempt:unexpected,createIssue:unexpected,addSubIssue:unexpected,editIssueBody:unexpected,setIssueOpen:unexpected,editPr:unexpected,rerunCheck:unexpected,createPr:unexpected,mergePr:unexpected,
   };
-  const controller=new RoundtableController({files:createAgendaFiles(root),github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:()=>{},onError:unexpected});
+  const controller=new RoundtableController({files:createAgendaFiles(root),github,host,cwd:root,workflow,intervalSeconds:3600,onChange:()=>{},onError:unexpected});
   const main:Caller={kind:'main',agentId:'Main',sessionId:'external-main',sessionFile:null};controller.setMain(main);
   try {
     expect((await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]})).ok).toBe(true);

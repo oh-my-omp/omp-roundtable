@@ -2,12 +2,18 @@ import {expect,test} from 'bun:test';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import type {Caller,Facts,PortError,PrSnapshot,Result,Role} from '../src/domain/model.ts';
+import type {Caller,Facts,PortError,PrSnapshot,Result,Role,Workflow} from '../src/domain/model.ts';
 import type {GitHubPort,HostPort,PrWrite,SeatLaunch} from '../src/ports/contracts.ts';
 import {createAgendaFiles} from '../src/ports/state.ts';
 import {RoundtableController} from '../src/runtime/controller.ts';
 import {Attention} from '../src/runtime/attention.ts';
 import {bodyHash} from '../src/domain/identity.ts';
+import {YAML} from 'bun';
+import {parseWorkflow} from '../src/domain/parse.ts';
+
+const parsedWorkflow=parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text()));
+if(!parsedWorkflow.ok)throw new Error(parsedWorkflow.error.reason);
+const defaultWorkflow=parsedWorkflow.value;
 
 // A fake host and a mutable GitHub source drive the real controller, so these tests observe which seats the
 // relay starts, at which exact commit, and when Main is woken. Native sessions and git live in the host port.
@@ -21,7 +27,7 @@ const closes=(number:number)=>`Closes test/roundtable#${number}`;
 function success<T>(value:T):Result<T,PortError>{return {ok:true,value};}
 function unexpected():never {throw new Error('Unexpected port call');}
 
-function harness(root:string) {
+function harness(root:string,workflow:Workflow=defaultWorkflow) {
   const source:Facts={viewer:'test',prs:[],links:[],maintenance:[],commits:[],checkAttempts:[],createdIssues:[],
     issues:[issueA,issueB].map(ref=>({ref,body:`Deliver ${ref.number}.`,bodyHash:bodyHash(`Deliver ${ref.number}.`),updatedAt:1,state:'open' as const,lastClose:null,lastReopen:null,children:[]})),
     repos:[{repo:repository,defaultBranch:'main',defaultHead:BASE,bases:[{name:'main',state:{kind:'present',head:BASE,isDefault:true,rules:{required:[],strict:false,constraints:[]}}}]}],
@@ -51,7 +57,7 @@ function harness(root:string) {
     branchHead:unexpected,issue:unexpected,pr:unexpected,issuesCreatedSince:unexpected,checkAttempt:unexpected,createIssue:unexpected,addSubIssue:unexpected,editIssueBody:unexpected,rerunCheck:unexpected,
   };
   const live=new Map<string,SeatLaunch>(),launches:SeatLaunch[]=[];
-  const host:HostPort={bind:unexpected,finish:async()=>success(null),dispose:async()=>{},
+  const host:HostPort={agents:async()=>success(null),bind:unexpected,finish:async()=>success(null),dispose:async()=>{},
     active:(ticketId,role)=>live.has(`${ticketId}/${role}`),
     seated:(ticketId,role,revision)=>launches.some(seat=>seat.ticketId===ticketId&&seat.role===role&&seat.revision===revision),
     launch:async input=>{launches.push(input);live.set(`${input.ticketId}/${input.role}`,input);return success({agentId:`${input.role}-${launches.length}`,sessionFile:join(root,`${input.role}-${launches.length}.jsonl`),jobId:`job-${launches.length}`});},
@@ -63,7 +69,7 @@ function harness(root:string) {
     const agenda=controller?.snapshot();if(!agenda)return;
     const fresh=attention.observe(agenda,host.active);if(fresh.length)wakes.push(fresh);
   }
-  controller=new RoundtableController({files:createAgendaFiles(root),github,host,cwd:root,ownerAgent:'task:free',gateAgent:'task:free',intervalSeconds:3600,onChange:observe,onError:error=>errors.push(error)});
+  controller=new RoundtableController({files:createAgendaFiles(root),github,host,cwd:root,workflow:async()=>({ok:true,value:workflow}),intervalSeconds:3600,onChange:observe,onError:error=>errors.push(error)});
   const roundtable=controller;
   const main:Caller={kind:'main',agentId:'Main',sessionId:'main',sessionFile:null};roundtable.setMain(main);
   // run() is the entry the kick timer uses; calling it directly drains effects and relays deterministically.
@@ -108,7 +114,7 @@ test('one launch per ticket: the relay seats every later stage at its exact comm
     expect((await h.asSeat('A','owner',{op:'submit',ticketId:'A',revision:1,branch:'feature-1',head:HEAD,title:'Deliver A',body:closes(1)})).ok).toBe(true);
     h.exit('A','owner',true);
     await h.drain();
-    expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'Reviewing',gates:{review:null,accept:null}});
+    expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'Reviewing',gates:{pullRequest:null,mergeCommit:null}});
     expect(h.launches).toHaveLength(1);
 
     // A mergeable PR with passing checks seats fresh review and accept at the PR head.

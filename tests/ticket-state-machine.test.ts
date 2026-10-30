@@ -1,7 +1,11 @@
 import {describe,expect,test} from 'bun:test';
 import {createHash} from 'node:crypto';
-import type {Agenda,Caller,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket} from '../src/domain/model.ts';
-import {applyOperation,availableRoles,confirmEffect,createAgenda,effectPrecondition,reconcile,satisfiedResult} from '../src/domain/engine.ts';
+import type {Agenda,Caller,Effect,Facts,IssueRef,IssueSnapshot,MaintenanceObservation,PrSnapshot,Repo,RepoSnapshot,Result,Role,Target,Ticket,Workflow} from '../src/domain/model.ts';
+import {applyOperation,availableRoles,closureRoles,confirmEffect,createAgenda,effectPrecondition,reconcile,satisfiedResult} from '../src/domain/engine.ts';
+import {YAML} from 'bun';
+import {parseAgenda,parseWorkflow} from '../src/domain/parse.ts';
+
+const defaultWorkflow=unwrap(parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text())),'default workflow');
 
 // These typed in-memory source snapshots exercise domain transitions only.
 // GitHub subprocess pagination and real TUI delivery have separate integration coverage.
@@ -113,13 +117,13 @@ function scenario(options:{
   });
 }
 
-function conveneTicket():Agenda {
-  return unwrap(createAgenda({op:'convene',parent:null,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null}]},openSource(),AT,'agenda-1'),'convene');
+function conveneTicket(workflow:Workflow=defaultWorkflow):Agenda {
+  return unwrap(createAgenda({op:'convene',parent:null,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null}]},workflow,openSource(),AT,'agenda-1'),'convene');
 }
 
 /** Drive convene → Owner submit → source-confirmed publication (Reviewing with both gates pending). */
-function publishTicket():{agenda:Agenda;facts:Facts} {
-  const publishing=unwrap(applyOperation(conveneTicket(),{op:'submit',ticketId:TICKET,revision:1,branch:BRANCH,head:HEAD,title:PR_TITLE,body:PR_BODY},seat('owner',OWNER_SESSION,1),openSource(),AT),'owner submit');
+function publishTicket(workflow:Workflow=defaultWorkflow):{agenda:Agenda;facts:Facts} {
+  const publishing=unwrap(applyOperation(conveneTicket(workflow),{op:'submit',ticketId:TICKET,revision:1,branch:BRANCH,head:HEAD,title:PR_TITLE,body:PR_BODY},seat('owner',OWNER_SESSION,1),openSource(),AT),'owner submit');
   const effect=effectOf(publishing,item=>item.action.kind==='publishPr');
   const facts=scenario({prHead:HEAD,baseHead:BASE,prState:OPEN_STATE,issueState:'open'});
   const result=satisfiedResult(publishing,effect,facts);
@@ -160,8 +164,7 @@ describe('ticket delivery lifecycle',()=>{
     const published=ticketOf(submitted);
     expect(published.state).toBe('Reviewing');
     expect(published.pr?.ref).toEqual(PR);
-    expect(published.gates.review?.status).toBe('pending');
-    expect(published.gates.accept?.status).toBe('pending');
+    expect(published.gates.pullRequest?.verdicts).toEqual([{role:'review',status:'pending',note:''},{role:'accept',status:'pending',note:''}]);
     expect(availableRoles(submitted,published)).toEqual(['review','accept']);
   });
 
@@ -173,10 +176,10 @@ describe('ticket delivery lifecycle',()=>{
     const after=ticketOf(rejecting);
     expect(after.state).toBe('Coding');
     expect(after.revision).toBe(before.revision+1);
-    expect(after.gates.review).toBeNull();
-    expect(after.gates.accept).toBeNull();
+    expect(after.gates.pullRequest).toBeNull();
+    expect(after.gates.mergeCommit).toBeNull();
     expect(after.ownerSessionFile).toBe(OWNER_SESSION);
-    const finding=after.notes.find(note=>note.role==='review'&&note.kind==='finding');
+    const finding=after.notes.find(note=>note.author.kind==='seat'&&note.author.role==='review'&&note.kind==='finding');
     expect(finding?.text).toBe('Missing regression for the drift check.');
     expect(rejecting.effects.some(item=>item.action.kind==='merge')).toBe(false);
   });
@@ -185,14 +188,14 @@ describe('ticket delivery lifecycle',()=>{
     const {agenda,facts}=publishTicket();
     const revision=ticketOf(agenda).revision;
     const reviewed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision,role:'review',ok:true,note:'Review approves.'},seat('review',REVIEW_SESSION,revision),facts,AT),'review verdict');
-    expect(ticketOf(reviewed).gates.review?.status).toBe('passed');
+    expect(ticketOf(reviewed).gates.pullRequest?.verdicts.find(verdict=>verdict.role==='review')?.status).toBe('passed');
 
     const rejected=unwrap(applyOperation(reviewed,{op:'verdict',ticketId:TICKET,revision,role:'accept',ok:false,note:'Accept demands a regression.'},seat('accept',ACCEPT_SESSION,revision),facts,AT),'accept verdict');
     const ticket=ticketOf(rejected);
     expect(ticket.state).toBe('Coding');
     expect(ticket.revision).toBe(revision+1);
-    expect(ticket.gates.review).toBeNull();
-    expect(ticket.gates.accept).toBeNull();
+    expect(ticket.gates.pullRequest).toBeNull();
+    expect(ticket.gates.mergeCommit).toBeNull();
     expect(rejected.effects.some(item=>item.action.kind==='merge')).toBe(false);
   });
 
@@ -210,10 +213,10 @@ describe('ticket delivery lifecycle',()=>{
     const verifying=ticketOf(agenda);
     expect(verifying.state).toBe('Verifying');
     expect(verifying.terminal).toEqual({kind:'merged',pr:PR,mergeSha:MERGE,at:MERGED_AT});
-    expect(verifying.gates.postMerge?.status).toBe('pending');
+    expect(verifying.gates.mergeCommit?.verdicts).toEqual([{role:'postMerge',status:'pending',note:''}]);
 
     const postMerged=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision:verifying.revision,role:'postMerge',ok:true,note:'Post-merge verified.'},seat('postMerge',POST_MERGE_SESSION,verifying.revision),mergedFacts,AT),'postMerge verdict');
-    expect(ticketOf(postMerged).gates.postMerge?.status).toBe('passed');
+    expect(ticketOf(postMerged).gates.mergeCommit?.verdicts).toEqual([{role:'postMerge',status:'passed',note:'Post-merge verified.'}]);
 
     const closingEffect=effectOf(postMerged,item=>item.action.kind==='setIssueState'&&item.state.kind==='ready');
     const closedFacts=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'close-1',at:CLOSED_AT}});
@@ -244,8 +247,8 @@ describe('ticket delivery lifecycle',()=>{
     const ticket=ticketOf(agenda);
     expect(ticket.state).toBe('Escalated');
     expect(ticket.revision).toBe(revision+1);
-    expect(ticket.gates.review).toBeNull();
-    expect(ticket.gates.accept).toBeNull();
+    expect(ticket.gates.pullRequest).toBeNull();
+    expect(ticket.gates.mergeCommit).toBeNull();
     expect(effectPrecondition(agenda,mergeEffect,drifted)).not.toBeNull();
 
     const escalated=structuredClone(agenda);
@@ -282,8 +285,7 @@ describe('ticket delivery lifecycle',()=>{
     expect(ticket.state).toBe('Reviewing');
     expect(ticket.revision).toBe(revision+1);
     expect(ticket.pr?.head).toBe(DRIFTED_HEAD);
-    expect(ticket.gates.review).toMatchObject({status:'pending',stamp:{head:DRIFTED_HEAD}});
-    expect(ticket.gates.accept).toMatchObject({status:'pending',stamp:{head:DRIFTED_HEAD}});
+    expect(ticket.gates.pullRequest).toMatchObject({stamp:{head:DRIFTED_HEAD},verdicts:[{role:'review',status:'pending'},{role:'accept',status:'pending'}]});
   });
 
   test('a contract body change after both approvals escalates without an authorized merge',()=>{
@@ -336,7 +338,7 @@ test('independent tickets are runnable while a dependent waits for source-confir
     {id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null},
     {id:'B',issue:second,target:TARGET,dependsOn:[],adoptPr:null},
     {id:'C',issue:third,target:TARGET,dependsOn:[TICKET],adoptPr:null},
-  ]},source,AT,'agenda-parallel'),'convene parallel graph');
+  ]},defaultWorkflow,source,AT,'agenda-parallel'),'convene parallel graph');
   const main:Caller={kind:'main',agentId:'Main',sessionId:'coordinator',sessionFile:null};
   agenda.run={kind:'attached',id:'run',mainAgentId:main.agentId,mainSessionId:main.sessionId};
   expect(availableRoles(agenda,ticketOf(agenda))).toEqual(['owner']);
@@ -363,7 +365,7 @@ test('a cyclic dependency graph is rejected before an agenda can run',()=>{
   const result=createAgenda({op:'convene',parent:null,tickets:[
     {id:'A',issue:ISSUE,target:TARGET,dependsOn:['B'],adoptPr:null},
     {id:'B',issue:other,target:TARGET,dependsOn:['A'],adoptPr:null},
-  ]},source,AT,'agenda-cycle');
+  ]},defaultWorkflow,source,AT,'agenda-cycle');
   expect(result).toMatchObject({ok:false,error:{kind:'invalidTopology'}});
 });
 
@@ -374,7 +376,7 @@ test('parent membership remains valid after a topology ruling and closure reject
   const agenda=unwrap(createAgenda({op:'convene',parent,tickets:[
     {id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:null},
     {id:'other',issue:other,target:TARGET,dependsOn:[],adoptPr:null},
-  ]},facts,AT,'parent-agenda'),'parent convene');
+  ]},defaultWorkflow,facts,AT,'parent-agenda'),'parent convene');
   const main:Caller={kind:'main',agentId:'Main',sessionId:'parent-main',sessionFile:null};
   agenda.run={kind:'attached',id:'run',mainAgentId:main.agentId,mainSessionId:main.sessionId};
   expect(applyOperation(agenda,{op:'resolve',ticketId:TICKET,revision:1,to:'Coding',ruling:'Remove still attached child.',remove:['other']},main,facts,AT)).toMatchObject({ok:false,error:{kind:'invalidTopology'}});
@@ -392,7 +394,7 @@ test('GitHub draft and behind observations cannot authorize a merge or masquerad
     reconcile(agenda,facts,AT);
     const ticket=ticketOf(agenda);
     expect(ticket.state).toBe(status==='behind'?'Coding':'Escalated');
-    expect(ticket.gates.review).toBeNull();
+    expect(ticket.gates.pullRequest).toBeNull();
     expect(ticket.notes.at(-1)?.text).not.toBe('PR conflicts with the target.');
     expect(effectPrecondition(agenda,effectOf(agenda,effect=>effect.action.kind==='merge'),facts)).not.toBeNull();
   }
@@ -420,17 +422,17 @@ test('postMerge keeps its merge anchor across independent target advances but re
   const result=satisfiedResult(agenda,effect,mergedFacts);
   if(!result)throw new Error('Merge was not source-confirmed');
   confirmEffect(agenda,effect,result,mergedFacts,AT);
-  const revision=ticketOf(agenda).revision,stamp=structuredClone(ticketOf(agenda).gates.postMerge?.stamp);
+  const revision=ticketOf(agenda).revision,stamp=structuredClone(ticketOf(agenda).gates.mergeCommit?.stamp);
   const advanced=scenario({prHead:HEAD,baseHead:DRIFTED_HEAD,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'merge-close',at:MERGED_AT}});
   advanced.commits.push({repo:REPO,ancestor:MERGE,descendant:DRIFTED_HEAD,result:'contains'});
   reconcile(agenda,advanced,AT+1);
   expect(ticketOf(agenda).revision).toBe(revision);
-  expect(ticketOf(agenda).gates.postMerge?.stamp).toEqual(stamp);
+  expect(ticketOf(agenda).gates.mergeCommit?.stamp).toEqual(stamp);
   const lost=structuredClone(agenda),rewritten=structuredClone(advanced);
   rewritten.commits[0]!.result='notContained';
   reconcile(lost,rewritten,AT+2);
   expect(ticketOf(lost).state).toBe('Escalated');
-  expect(ticketOf(lost).gates.postMerge).toBeNull();
+  expect(ticketOf(lost).gates.mergeCommit).toBeNull();
   const passed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision,role:'postMerge',ok:true,note:'Target still contains the exact merge after an independent delivery.'},seat('postMerge',POST_MERGE_SESSION,revision),advanced,AT+3),'stable postMerge');
   expect(ticketOf(passed).state).toBe('Done');
 });
@@ -439,7 +441,7 @@ test('closure fingerprints survive unrelated forward merges but reject lost chil
   const parent={repo:REPO,number:1};
   const source=scenario({prHead:HEAD,baseHead:MERGE,prState:MERGED_STATE,issueState:'closed',lastClose:{id:'child-close',at:MERGED_AT}});
   source.issues.push({...issueSnapshot('open',null),ref:parent,children:[ISSUE]});
-  let agenda=unwrap(createAgenda({op:'convene',parent,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:PR}]},source,AT,'closure-anchor'),'adopt merged child');
+  let agenda=unwrap(createAgenda({op:'convene',parent,tickets:[{id:TICKET,issue:ISSUE,target:TARGET,dependsOn:[],adoptPr:PR}]},defaultWorkflow,source,AT,'closure-anchor'),'adopt merged child');
   agenda=unwrap(applyOperation(agenda,{op:'verdict',ticketId:TICKET,revision:1,role:'postMerge',ok:true,note:'Verified the merged child.'},seat('postMerge',POST_MERGE_SESSION,1),source,AT),'postMerge');
   const closure=agenda.closure;if(!closure)throw new Error('Expected closure after child Done');
   const original=structuredClone(closure.gate.stamp),revision=closure.revision;
@@ -457,5 +459,5 @@ test('closure fingerprints survive unrelated forward merges but reject lost chil
   expect(lost.closure?.state).toBe('Escalated');
   const caller:Caller={kind:'seat',agentId:'closure',sessionId:'closure',sessionFile:'/tmp/closure.jsonl',ticketId:closure.id,revision,role:'closure'};
   const passed=unwrap(applyOperation(agenda,{op:'verdict',ticketId:closure.id,revision,role:'closure',ok:true,note:'Every terminal remains contained in the current target.'},caller,advanced,AT+3),'stable closure');
-  expect(passed.closure?.gate.status).toBe('passed');
+  expect(passed.closure?.gate.verdicts).toEqual([{role:'closure',status:'passed',note:'Every terminal remains contained in the current target.'}]);
 });
