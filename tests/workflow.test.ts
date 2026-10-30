@@ -2,61 +2,89 @@ import {describe,expect,test} from 'bun:test';
 import {YAML} from 'bun';
 import {mkdir,mkdtemp,rm,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
-import {parseWorkflow} from '../src/domain/parse.ts';
+import {encodeWorkflow,parseWorkflow,type Workflow} from '../src/domain/workflow.ts';
 import {loadWorkflow} from '../src/ports/workflow.ts';
 
-const parsed=parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text()));
+const source=await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text();
+const parsed=parseWorkflow(YAML.parse(source));
 if(!parsed.ok)throw new Error(parsed.error.reason);
 const defaultWorkflow=parsed.value;
+function invalid(change:(workflow:Workflow)=>void):void {
+  const workflow=structuredClone(defaultWorkflow);change(workflow);
+  expect(parseWorkflow(encodeWorkflow(workflow)).ok).toBe(false);
+}
 
 describe('workflow validation',()=>{
-  test('parseWorkflow rejects a duplicate judge role across stages',()=>{
+  test('parseWorkflow accepts the built-in state machines and encode/parse is an exact inverse',()=>{
+    expect(defaultWorkflow.ticket.initial).toBe('Coding');
+    expect(defaultWorkflow.ticket.adopted).toEqual({pullRequest:'AwaitingChecks',mergeCommit:'Verifying'});
+    expect(parseWorkflow(encodeWorkflow(defaultWorkflow))).toEqual({ok:true,value:defaultWorkflow});
+  });
+  test('parseWorkflow rejects an unknown target',()=>invalid(workflow=>{
+    const state=workflow.ticket.states.Coding!;if(state.kind==='work')state.on.submitted.otherwise='Missing';
+  }));
+  test('parseWorkflow rejects an unreachable state',()=>invalid(workflow=>{workflow.ticket.states.Orphan={kind:'final',guard:null};}));
+  test('parseWorkflow rejects an entry guard fallback cycle',()=>invalid(workflow=>{
+    workflow.ticket.states.Reviewing!.guard={when:{kind:'checks',is:'passing'},otherwise:'Verifying'};
+    workflow.ticket.states.Verifying!.guard={when:{kind:'checks',is:'passing'},otherwise:'Reviewing'};
+  }));
+  test('parseWorkflow rejects a guarded initial state',()=>invalid(workflow=>{
+    workflow.ticket.states.Coding!.guard={when:{kind:'checks',is:'passing'},otherwise:'Publishing'};
+  }));
+  test('parseWorkflow rejects a non-work initial state',()=>invalid(workflow=>{workflow.ticket.initial='Publishing';}));
+  test('parseWorkflow rejects a duplicate judge role across machines',()=>invalid(workflow=>{
+    const state=workflow.parent.states.Reviewing!;if(state.kind==='judge')state.judges[0]!.role='review';
+  }));
+  test('parseWorkflow rejects a judge role equal to a work role',()=>invalid(workflow=>{
+    const state=workflow.parent.states.Reviewing!;if(state.kind==='judge')state.judges[0]!.role='owner';
+  }));
+  test('parseWorkflow rejects a work role with two agents',()=>invalid(workflow=>{
+    const coding=workflow.ticket.states.Coding!;
+    if(coding.kind!=='work')throw new Error('Expected Coding work state');
+    workflow.ticket.states.Rework={...structuredClone(coding),agent:'different-agent'};
+    coding.on.escalated.otherwise='Rework';
+  }));
+  test('parseWorkflow rejects merge requires naming a mergeCommit judge',()=>invalid(workflow=>{
+    const state=workflow.ticket.states.Merging!;if(state.kind==='action'&&state.action.kind==='merge')state.action.requires=['Verifying'];
+  }));
+  test('parseWorkflow rejects parent conditions using checks',()=>invalid(workflow=>{
+    workflow.parent.states.Reviewing!.guard={when:{kind:'checks',is:'passing'},otherwise:'Closing'};
+  }));
+  test('parseWorkflow rejects a missing outcome',()=>{
+    expect(parseWorkflow(YAML.parse(source.replace('on: {submitted: Publishing, escalated: escalate}','on: {submitted: Publishing}'))).ok).toBe(false);
+  });
+  test('parseWorkflow rejects a branch fallback before the last branch',()=>{
+    const text=source.replace('submitted: Publishing','submitted: [{to: Publishing}, {when: {checks: passing}, to: Coding}]');
+    expect(parseWorkflow(YAML.parse(text)).ok).toBe(false);
+  });
+  for(const name of ['escalate','Escalated'])test(`parseWorkflow rejects reserved state name ${name}`,()=>invalid(workflow=>{workflow.ticket.states[name]={kind:'final',guard:null};}));
+  test('parseWorkflow rejects unknown fields at workflow, machine, state and judge boundaries',()=>{
+    for(const text of [source+'extra: true\n',source.replace('  initial: Coding','  extra: true\n  initial: Coding'),source.replace('      role: owner','      extra: true\n      role: owner'),source.replace('        - role: review','        - extra: true\n          role: review')])expect(parseWorkflow(YAML.parse(text)).ok).toBe(false);
+  });
+  test('parseWorkflow rejects empty work and judge agents',()=>{
+    for(const name of ['task:high','task:mid'])expect(parseWorkflow(YAML.parse(source.replace(name,'""'))).ok).toBe(false);
+  });
+  test('parseWorkflow accepts empty judge states in both machines',()=>{
     const workflow=structuredClone(defaultWorkflow);
-    workflow.judges.mergeCommit[0]!.role=workflow.judges.pullRequest[0]!.role;
-    expect(parseWorkflow(workflow)).toMatchObject({ok:false,error:{path:'judges'}});
-  });
-  test('parseWorkflow reserves owner for the implementation seat',()=>{
-    const workflow=structuredClone(defaultWorkflow);workflow.judges.parent[0]!.role='owner';
-    expect(parseWorkflow(workflow)).toMatchObject({ok:false,error:{path:'judges'}});
-  });
-  test('parseWorkflow rejects unknown fields at every workflow level',()=>{
-    const judge=defaultWorkflow.judges.pullRequest[0]!;
-    for(const workflow of [
-      {...defaultWorkflow,extra:true},
-      {...defaultWorkflow,owner:{...defaultWorkflow.owner,extra:true}},
-      {...defaultWorkflow,judges:{...defaultWorkflow.judges,extra:[]}},
-      {...defaultWorkflow,judges:{...defaultWorkflow.judges,pullRequest:[{...judge,extra:true}]}},
-    ])expect(parseWorkflow(workflow).ok).toBe(false);
-  });
-  test('parseWorkflow rejects empty owner and judge agents',()=>{
-    expect(parseWorkflow({...defaultWorkflow,owner:{...defaultWorkflow.owner,agent:''}}).ok).toBe(false);
-    const workflow=structuredClone(defaultWorkflow);workflow.judges.mergeCommit[0]!.agent='';
-    expect(parseWorkflow(workflow).ok).toBe(false);
-  });
-  test('parseWorkflow accepts all three empty judge lists',()=>{
-    expect(parseWorkflow({owner:defaultWorkflow.owner,judges:{pullRequest:[],mergeCommit:[],parent:[]}})).toMatchObject({ok:true,value:{judges:{pullRequest:[],mergeCommit:[],parent:[]}}});
+    for(const state of [...Object.values(workflow.ticket.states),...Object.values(workflow.parent.states)])if(state.kind==='judge')state.judges=[];
+    expect(parseWorkflow(encodeWorkflow(workflow))).toEqual({ok:true,value:workflow});
   });
 });
 
 describe('workflow file source selection',()=>{
-  test('a missing dataDir workflow loads the built-in roster',async()=>{
+  test('a missing dataDir workflow loads the built-in state machines',async()=>{
     const root=await mkdtemp('/tmp/roundtable-workflow-');
-    try {
-      const result=await loadWorkflow({kind:'dataDir',path:join(root,'workflow.yml')});
-      expect(result.ok).toBe(true);if(!result.ok)throw new Error(result.error.reason);
-      expect(result.value.owner.agent).toBe('task:high');
-      expect(result.value.judges.pullRequest.map(judge=>judge.role)).toEqual(['review','accept']);
-      expect(result.value.judges.mergeCommit.map(judge=>judge.role)).toEqual(['postMerge']);
-      expect(result.value.judges.parent.map(judge=>judge.role)).toEqual(['closure']);
-      expect(Object.values(result.value.judges).flat().every(judge=>judge.agent==='task:mid')).toBe(true);
-    }finally {await rm(root,{recursive:true,force:true});}
+    try {expect(await loadWorkflow({kind:'dataDir',path:join(root,'workflow.yml')})).toEqual({ok:true,value:defaultWorkflow});}
+    finally {await rm(root,{recursive:true,force:true});}
   });
-  test('an existing dataDir workflow overrides the built-in roster',async()=>{
+  test('an existing dataDir workflow overrides the built-in workflow',async()=>{
     const root=await mkdtemp('/tmp/roundtable-workflow-');
     try {
-      const path=join(root,'workflow.yml');
-      await writeFile(path,'owner:\n  agent: implementer\n  brief: Deliver the change.\njudges:\n  pullRequest:\n    - role: safety\n      agent: auditor\n      brief: Check production safety.\n  mergeCommit: []\n  parent: []\n');
-      expect(await loadWorkflow({kind:'dataDir',path})).toEqual({ok:true,value:{owner:{agent:'implementer',brief:'Deliver the change.'},judges:{pullRequest:[{role:'safety',agent:'auditor',brief:'Check production safety.'}],mergeCommit:[],parent:[]}}});
+      const path=join(root,'workflow.yml'),workflow=structuredClone(defaultWorkflow);
+      const coding=workflow.ticket.states.Coding!;if(coding.kind!=='work')throw new Error('Expected work');
+      coding.agent='implementer';coding.brief='Deliver the configured change.';
+      await writeFile(path,YAML.stringify(encodeWorkflow(workflow)));
+      expect(await loadWorkflow({kind:'dataDir',path})).toEqual({ok:true,value:workflow});
     }finally {await rm(root,{recursive:true,force:true});}
   });
   test('a missing configured workflow reports its path rather than falling back',async()=>{
@@ -66,21 +94,19 @@ describe('workflow file source selection',()=>{
       expect(await loadWorkflow({kind:'configured',path})).toMatchObject({ok:false,error:{source:path,reason:expect.stringContaining('does not exist')}});
     }finally {await rm(root,{recursive:true,force:true});}
   });
-  test('an unreadable dataDir workflow errors instead of falling back to the built-in roster',async()=>{
+  test('an EISDIR dataDir workflow errors instead of falling back',async()=>{
     const root=await mkdtemp('/tmp/roundtable-workflow-');
     try {
-      // A directory in the file's place fails to read with EISDIR, not ENOENT.
       const path=join(root,'workflow.yml');await mkdir(path);
       expect(await loadWorkflow({kind:'dataDir',path})).toMatchObject({ok:false,error:{source:path}});
     }finally {await rm(root,{recursive:true,force:true});}
   });
-  for(const [name,text] of [['invalid YAML','owner: [unterminated'],['invalid schema','owner: {}\njudges: {}\n']] as const)test(`an existing dataDir workflow with ${name} errors instead of using defaults`,async()=>{
+  for(const [name,text] of [['invalid YAML','ticket: [unterminated'],['invalid schema','ticket: {}\nparent: {}\n']] as const)test(`an existing dataDir workflow with ${name} errors instead of using defaults`,async()=>{
     const root=await mkdtemp('/tmp/roundtable-workflow-');
     try {
       const path=join(root,'workflow.yml');await writeFile(path,text);
       const result=await loadWorkflow({kind:'dataDir',path});
-      expect(result.ok).toBe(false);
-      if(result.ok)throw new Error('Invalid override silently loaded a workflow');
+      expect(result.ok).toBe(false);if(result.ok)throw new Error('Invalid override silently loaded');
       expect(result.error.source).toBe(path);
       if(name==='invalid YAML')expect(result.error.reason).toContain('Invalid YAML');
     }finally {await rm(root,{recursive:true,force:true});}
