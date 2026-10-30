@@ -8,7 +8,7 @@ import {createAgendaFiles} from '../src/ports/state.ts';
 import {RoundtableController} from '../src/runtime/controller.ts';
 import {bodyHash} from '../src/domain/identity.ts';
 import {YAML} from 'bun';
-import {parseWorkflow} from '../src/domain/parse.ts';
+import {parseWorkflow} from '../src/domain/workflow.ts';
 
 const parsedWorkflow=parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text()));
 if(!parsedWorkflow.ok)throw new Error(parsedWorkflow.error.reason);
@@ -52,8 +52,9 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     const owner:Caller={kind:'seat',agentId:'Owner',sessionId:'first-owner',sessionFile:join(root,'owner.jsonl'),ticketId:'one',revision:1,role:'owner'};
     if(operation==='publishPr')expect((await controller.execute(owner,{op:'submit',ticketId:'one',revision:1,branch:'feature',head,title:'Deliver one',body:'Closes test/roundtable#1'})).ok).toBe(true);
     else for(const role of ['review','accept'] as const){
-      const gate:Caller={kind:'seat',agentId:role,sessionId:role,sessionFile:join(root,`${role}.jsonl`),ticketId:'one',revision:1,role};
-      expect((await controller.execute(gate,{op:'verdict',ticketId:'one',revision:1,role,ok:true,note:'Verified the exact contract and head.'})).ok).toBe(true);
+      const revision=controller.snapshot()!.tickets[0]!.revision;
+      const gate:Caller={kind:'seat',agentId:role,sessionId:role,sessionFile:join(root,`${role}.jsonl`),ticketId:'one',revision,role};
+      expect((await controller.execute(gate,{op:'verdict',ticketId:'one',revision,role,ok:true,note:'Verified the exact contract and head.'})).ok).toBe(true);
     }
     if(operation==='merge'){
       source.prs[0]!.mergeable='unknown';
@@ -69,7 +70,7 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     expect(calls).toBe(1);
     expect(failed.effects[0]?.state.kind).toBe('uncertain');
     expect(failed.tickets[0]?.state).toBe('Escalated');
-    if(operation==='publishPr')expect(failed.tickets[0]?.ownerSessionFile).toBe(owner.sessionFile);
+    if(operation==='publishPr')expect(failed.tickets[0]?.sessions.owner).toBe(owner.sessionFile);
     await controller.shutdown();
     controller=new RoundtableController({files,github,host,cwd:root,workflow:async()=>{throw new Error('Resume must use the frozen workflow');},intervalSeconds:3600,onChange:()=>{},onError:error=>errors.push(error)});
     const successor:Caller={kind:'main',agentId:'Main',sessionId:'second-main',sessionFile:null};controller.setMain(successor);
@@ -77,7 +78,7 @@ for(const operation of ['publishPr','merge'] as const)test(`an unknown ${operati
     await controller.run();await controller.run();
     expect(calls).toBe(1);
     expect(controller.snapshot()?.effects[0]?.state.kind).toBe('uncertain');
-    if(operation==='publishPr')expect(controller.snapshot()?.tickets[0]?.ownerSessionFile).toBe(owner.sessionFile);
+    if(operation==='publishPr')expect(controller.snapshot()?.tickets[0]?.sessions.owner).toBe(owner.sessionFile);
     expect(errors).toEqual([]);
   }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}
 });
@@ -97,18 +98,22 @@ test('Main can adopt a source-confirmed external merge below the target head in 
   const main:Caller={kind:'main',agentId:'Main',sessionId:'external-main',sessionFile:null};controller.setMain(main);
   try {
     expect((await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]})).ok).toBe(true);
-    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:1,ruling:'The author merged this change externally; the current target contains its merge.',to:'Done',adoptPr:prRef});
+    const adopted=await controller.execute(main,{op:'resolve',ticketId:'one',revision:1,ruling:'The author merged this change externally; verify the contained merge.',to:'Verifying',adoptPr:prRef});
     expect(adopted.ok).toBe(true);
     expect(comparisons).toContain(`${merge}:${base}`);
-    expect(controller.snapshot()?.tickets[0]).toMatchObject({state:'Done',terminal:{kind:'merged',mergeSha:merge}});
+    expect(controller.snapshot()?.tickets[0]).toMatchObject({state:'Verifying',terminal:{kind:'merged',mergeSha:merge}});
   }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}
 });
 
 test('convene checks every configured agent and refuses the agenda when one cannot host a seat',async()=>{
   const root=await mkdtemp(join(tmpdir(),'roundtable-agents-'));
-  const custom={owner:{agent:'builder',brief:'Deliver.'},judges:{
-    pullRequest:[{role:'quality',agent:'checker',brief:'Check.'},{role:'security',agent:'missing-agent',brief:'Audit.'}],
-    mergeCommit:[{role:'deploy',agent:'deployer',brief:'Verify.'}],parent:[{role:'release',agent:'checker',brief:'Release.'}]}};
+  const custom=structuredClone(defaultWorkflow);
+  custom.ticket.states.Coding={...custom.ticket.states.Coding!,kind:'work',role:'owner',guard:null,on:{submitted:{branches:[],otherwise:'Publishing'},escalated:{branches:[],otherwise:'escalate'}},agent:'builder',brief:'Deliver.'};
+  custom.ticket.states.Reviewing={kind:'judge',subject:'pullRequest',guard:null,observe:{checksFailed:'Coding',conflict:'Coding',behind:'Coding',drift:'AwaitingChecks'},on:{passed:{branches:[],otherwise:'Merging'},rejected:{branches:[],otherwise:'Coding'},escalated:{branches:[],otherwise:'escalate'}},judges:[{role:'quality',agent:'checker',brief:'Check.'},{role:'security',agent:'missing-agent',brief:'Audit.'}]};
+  const verifying=custom.ticket.states.Verifying!,parent=custom.parent.states.Reviewing!;
+  if(verifying.kind!=='judge'||parent.kind!=='judge')throw new Error('Expected judge states');
+  verifying.judges=[{role:'deploy',agent:'deployer',brief:'Verify.'}];
+  parent.judges=[{role:'release',agent:'parent-agent',brief:'Release.'}];
   const checked:string[][]=[];
   const refusing:HostPort={...host,agents:async(_cwd,names)=>{checked.push([...names]);return {ok:false,error:{kind:'precondition',message:'Configured seat agent is unavailable: missing-agent'}};}};
   const github:GitHubPort={facts:unexpected,contains:unexpected,openPrsByHead:unexpected,branchHead:unexpected,issue:unexpected,pr:unexpected,issuesCreatedSince:unexpected,checkAttempt:unexpected,createIssue:unexpected,addSubIssue:unexpected,editIssueBody:unexpected,setIssueOpen:unexpected,editPr:unexpected,rerunCheck:unexpected,createPr:unexpected,mergePr:unexpected};
@@ -118,7 +123,7 @@ test('convene checks every configured agent and refuses the agenda when one cann
   try {
     const convened=await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]});
     expect(convened).toMatchObject({ok:false,error:{kind:'host',error:{kind:'precondition'}}});
-    expect(new Set(checked.flat())).toEqual(new Set(['builder','checker','missing-agent','deployer']));
+    expect(new Set(checked.flat())).toEqual(new Set(['builder','checker','missing-agent','deployer','parent-agent']));
     expect(controller.snapshot()).toBeNull();
     expect(await files.list()).toEqual({ok:true,value:[]});
   }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}

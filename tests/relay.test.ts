@@ -9,7 +9,7 @@ import {RoundtableController} from '../src/runtime/controller.ts';
 import {Attention} from '../src/runtime/attention.ts';
 import {bodyHash} from '../src/domain/identity.ts';
 import {YAML} from 'bun';
-import {parseWorkflow} from '../src/domain/parse.ts';
+import {parseWorkflow} from '../src/domain/workflow.ts';
 
 const parsedWorkflow=parseWorkflow(YAML.parse(await Bun.file(new URL('../src/default-workflow.yml',import.meta.url)).text()));
 if(!parsedWorkflow.ok)throw new Error(parsedWorkflow.error.reason);
@@ -114,7 +114,7 @@ test('one launch per ticket: the relay seats every later stage at its exact comm
     expect((await h.asSeat('A','owner',{op:'submit',ticketId:'A',revision:1,branch:'feature-1',head:HEAD,title:'Deliver A',body:closes(1)})).ok).toBe(true);
     h.exit('A','owner',true);
     await h.drain();
-    expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'Reviewing',gates:{pullRequest:null,mergeCommit:null}});
+    expect(h.controller.snapshot()!.tickets[0]).toMatchObject({state:'AwaitingChecks',gates:{}});
     expect(h.launches).toHaveLength(1);
 
     // A mergeable PR with passing checks seats fresh review and accept at the PR head.
@@ -126,17 +126,17 @@ test('one launch per ticket: the relay seats every later stage at its exact comm
     ]);
 
     // A failed review returns to Coding; the rework Owner waits until every gate seat of the ticket exited.
-    expect((await h.asSeat('A','review',{op:'verdict',ticketId:'A',revision:1,role:'review',ok:false,note:'Missing a regression test.'})).ok).toBe(true);
+    expect((await h.asSeat('A','review',{op:'verdict',ticketId:'A',revision:h.revision('A'),role:'review',ok:false,note:'Missing a regression test.'})).ok).toBe(true);
     h.exit('A','review',true);
     await h.drain();
     expect(h.launches).toHaveLength(3);
     h.exit('A','accept',false,'Roundtable seat revision was superseded');
     await h.drain();
-    expect(h.launches[3]).toMatchObject({role:'owner',revision:2,workspace:{kind:'fork',sessionFile:join(root,'A-owner-1.jsonl')}});
+    expect(h.launches[3]).toMatchObject({role:'owner',revision:5,workspace:{kind:'fork',sessionFile:join(root,'A-owner-1.jsonl')}});
     expect(h.controller.snapshot()!.tickets[0]!.state).toBe('Coding');
 
     h.source.branches[0]!.state={kind:'present',head:REWORK};
-    expect((await h.asSeat('A','owner',{op:'submit',ticketId:'A',revision:2,branch:'feature-1',head:REWORK,title:'Deliver A',body:closes(1)})).ok).toBe(true);
+    expect((await h.asSeat('A','owner',{op:'submit',ticketId:'A',revision:h.revision('A'),branch:'feature-1',head:REWORK,title:'Deliver A',body:closes(1)})).ok).toBe(true);
     h.exit('A','owner',true);
     await h.drain();
     h.source.prs[0]!.mergeable='yes';h.source.prs[0]!.checks={kind:'passing',required:[]};
@@ -161,7 +161,7 @@ test('one launch per ticket: the relay seats every later stage at its exact comm
     expect(h.wakes).toEqual([['launch:A'],['launch:B']]);
 
     // A noCode ruling queues the closure without waking Main; completion wakes it once to finish.
-    expect((await h.asMain({op:'resolve',ticketId:'B',revision:1,ruling:'Already satisfied by A.',to:'Done',noCode:'A delivered it.'})).ok).toBe(true);
+    expect((await h.asMain({op:'resolve',ticketId:'B',revision:1,ruling:'Already satisfied by A.',to:'Closing',noCode:'A delivered it.'})).ok).toBe(true);
     expect(h.wakes).toEqual([['launch:A'],['launch:B']]);
     await h.drain();
     expect(h.controller.snapshot()!.tickets.map(ticket=>ticket.state)).toEqual(['Done','Done']);
@@ -210,11 +210,13 @@ test('a seat that ends without a handoff while a refresh is in flight is not re-
 
 test('the relay uses each configured role agent and brief from Owner through parent closure',async()=>{
   const root=await mkdtemp('/tmp/roundtable-custom-relay-');
-  const workflow:Workflow={owner:{agent:'builder',brief:'Build the requested customer behavior.'},judges:{
-    pullRequest:[{role:'audit',agent:'security-agent',brief:'Audit the security boundary.'},{role:'experience',agent:'ux-agent',brief:'Inspect the user journey.'}],
-    mergeCommit:[{role:'deployed',agent:'runtime-agent',brief:'Exercise the merged runtime.'}],
-    parent:[{role:'aggregate',agent:'product-agent',brief:'Confirm the combined product outcome.'}],
-  }};
+  const workflow=structuredClone(defaultWorkflow);
+  const coding=workflow.ticket.states.Coding!,reviewing=workflow.ticket.states.Reviewing!,verifying=workflow.ticket.states.Verifying!,parent=workflow.parent.states.Reviewing!;
+  if(coding.kind!=='work'||reviewing.kind!=='judge'||verifying.kind!=='judge'||parent.kind!=='judge')throw new Error('Expected built-in seats');
+  coding.agent='builder';coding.brief='Build the requested customer behavior.';
+  reviewing.judges=[{role:'audit',agent:'security-agent',brief:'Audit the security boundary.'},{role:'experience',agent:'ux-agent',brief:'Inspect the user journey.'}];
+  verifying.judges=[{role:'deployed',agent:'runtime-agent',brief:'Exercise the merged runtime.'}];
+  parent.judges=[{role:'aggregate',agent:'product-agent',brief:'Confirm the combined product outcome.'}];
   const h=harness(root,workflow);
   h.source.issues.find(issue=>issue.ref.number===issueB.number)!.children=[issueA];
   try {
@@ -238,7 +240,7 @@ test('the relay uses each configured role agent and brief from Owner through par
     expect(h.launches.map(seat=>[seat.role,seat.agent])).toEqual([
       ['owner','builder'],['audit','security-agent'],['experience','ux-agent'],['deployed','runtime-agent'],['aggregate','product-agent'],
     ]);
-    for(const configured of [{role:'owner',...workflow.owner},...Object.values(workflow.judges).flat()]){
+    for(const configured of [coding,...reviewing.judges,...verifying.judges,...parent.judges]){
       const launch=h.launches.find(seat=>seat.role===configured.role)!;
       expect(launch.prompt).toContain(configured.brief);
     }
@@ -248,7 +250,9 @@ test('the relay uses each configured role agent and brief from Owner through par
 
 test('resume uses the frozen workflow without calling the current workflow loader',async()=>{
   const root=await mkdtemp('/tmp/roundtable-frozen-resume-');
-  const workflow=structuredClone(defaultWorkflow);workflow.owner={agent:'original-builder',brief:'Use the originally approved implementation brief.'};
+  const workflow=structuredClone(defaultWorkflow),coding=workflow.ticket.states.Coding!;
+  if(coding.kind!=='work')throw new Error('Expected work state');
+  coding.agent='original-builder';coding.brief='Use the originally approved implementation brief.';
   const h=harness(root,workflow);
   let resumed:RoundtableController|null=null,loads=0;
   try {
