@@ -1,6 +1,6 @@
 import {describe,expect,test} from 'bun:test';
 import {YAML} from 'bun';
-import {mkdtemp,rm,writeFile} from 'node:fs/promises';
+import {mkdir,mkdtemp,rm,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {parseWorkflow} from '../src/domain/parse.ts';
 import {loadWorkflow} from '../src/ports/workflow.ts';
@@ -64,6 +64,14 @@ describe('workflow file source selection',()=>{
     try {
       const path=join(root,'required.yml');
       expect(await loadWorkflow({kind:'configured',path})).toMatchObject({ok:false,error:{source:path,reason:expect.stringContaining('does not exist')}});
+    }finally {await rm(root,{recursive:true,force:true});}
+  });
+  test('an unreadable dataDir workflow errors instead of falling back to the built-in roster',async()=>{
+    const root=await mkdtemp('/tmp/roundtable-workflow-');
+    try {
+      // A directory in the file's place fails to read with EISDIR, not ENOENT.
+      const path=join(root,'workflow.yml');await mkdir(path);
+      expect(await loadWorkflow({kind:'dataDir',path})).toMatchObject({ok:false,error:{source:path}});
     }finally {await rm(root,{recursive:true,force:true});}
   });
   for(const [name,text] of [['invalid YAML','owner: [unterminated'],['invalid schema','owner: {}\njudges: {}\n']] as const)test(`an existing dataDir workflow with ${name} errors instead of using defaults`,async()=>{

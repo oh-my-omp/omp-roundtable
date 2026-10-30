@@ -139,7 +139,7 @@ function verdict(expect: Expect, output: string): {ok: boolean; note: string} {
 
 function commitScript(spec: TicketSpec, write: Record<string, string>, remove: string[], label: string): string {
   // `tee` keeps the script valid under the operator's bash interceptor, which refuses printf/echo redirection into files.
-  const writes = Object.entries(write).map(([path, content]) => `printf '%s' ${quote(content)} | tee ${quote(path)} >/dev/null`);
+  const writes = Object.entries(write).map(([path, content]) => `printf '%s' ${quote(content)} | tee -- ${quote(path)} >/dev/null`);
   const removes = remove.map(path => `git rm -q --ignore-unmatch ${quote(path)}`);
   return ['set -e', `git switch -q -C sim-${spec.id}`, ...writes, ...removes, 'git add -A',
     `git -c user.name=sim -c user.email=sim@local commit -q --allow-empty -m ${quote(`${spec.id} ${label}`)}`,

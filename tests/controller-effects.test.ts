@@ -103,3 +103,23 @@ test('Main can adopt a source-confirmed external merge below the target head in 
     expect(controller.snapshot()?.tickets[0]).toMatchObject({state:'Done',terminal:{kind:'merged',mergeSha:merge}});
   }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}
 });
+
+test('convene checks every configured agent and refuses the agenda when one cannot host a seat',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'roundtable-agents-'));
+  const custom={owner:{agent:'builder',brief:'Deliver.'},judges:{
+    pullRequest:[{role:'quality',agent:'checker',brief:'Check.'},{role:'security',agent:'missing-agent',brief:'Audit.'}],
+    mergeCommit:[{role:'deploy',agent:'deployer',brief:'Verify.'}],parent:[{role:'release',agent:'checker',brief:'Release.'}]}};
+  const checked:string[][]=[];
+  const refusing:HostPort={...host,agents:async(_cwd,names)=>{checked.push([...names]);return {ok:false,error:{kind:'precondition',message:'Configured seat agent is unavailable: missing-agent'}};}};
+  const github:GitHubPort={facts:unexpected,contains:unexpected,openPrsByHead:unexpected,branchHead:unexpected,issue:unexpected,pr:unexpected,issuesCreatedSince:unexpected,checkAttempt:unexpected,createIssue:unexpected,addSubIssue:unexpected,editIssueBody:unexpected,setIssueOpen:unexpected,editPr:unexpected,rerunCheck:unexpected,createPr:unexpected,mergePr:unexpected};
+  const files=createAgendaFiles(root);
+  const controller=new RoundtableController({files,github,host:refusing,cwd:root,workflow:async()=>({ok:true,value:custom}),intervalSeconds:3600,onChange:()=>{},onError:unexpected});
+  const main:Caller={kind:'main',agentId:'Main',sessionId:'agents-main',sessionFile:null};controller.setMain(main);
+  try {
+    const convened=await controller.execute(main,{op:'convene',parent:null,tickets:[{id:'one',issue,target:{repo:repository,base:'main'},dependsOn:[],adoptPr:null}]});
+    expect(convened).toMatchObject({ok:false,error:{kind:'host',error:{kind:'precondition'}}});
+    expect(new Set(checked.flat())).toEqual(new Set(['builder','checker','missing-agent','deployer']));
+    expect(controller.snapshot()).toBeNull();
+    expect(await files.list()).toEqual({ok:true,value:[]});
+  }finally {await controller.shutdown();await rm(root,{recursive:true,force:true});}
+});
