@@ -22,6 +22,8 @@ export interface GitHubPort {
   rerunCheck(repo:Repo,workflowRunId:number):Promise<Result<null,PortError>>;
 }
 export type StateError = {kind:'notFound'|'unsupportedFormat'|'corruptState'|'versionConflict'|'unavailable';message:string};
+/** A workflow that cannot be read or parsed; `source` is the file path the reason refers to. */
+export type WorkflowError = {source:string;reason:string};
 export interface AgendaFiles {
   load(id:AgendaId):Promise<Result<Agenda,StateError>>;
   list():Promise<Result<readonly Agenda[],StateError>>;
@@ -37,6 +39,8 @@ export type SeatExit = {ticketId:string;role:Role;revision:number};
 export interface HostPort {
   bind(ctx:ExtensionContext):Result<Caller,PortError>;
   launch(input:SeatLaunch):Promise<Result<SeatHandle,PortError>>;
+  /** Whether every named agent can host a seat in this workspace, checked before a workflow is frozen into an agenda. */
+  agents(cwd:string,names:readonly string[]):Promise<Result<null,PortError>>;
   active(ticketId:string,role:Role):boolean;
   /** Whether this host has started a seat for exactly this ticket, role and revision; a seat is one-shot per revision. */
   seated(ticketId:string,role:Role,revision:number):boolean;

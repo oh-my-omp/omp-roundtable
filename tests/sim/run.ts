@@ -9,7 +9,7 @@ import {closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, re
 import {join, resolve} from 'node:path';
 import type {Subprocess} from 'bun';
 import {z} from '@oh-my-pi/omptype/zod';
-import type {Agenda} from '../../src/domain/model.ts';
+import {JUDGE_STAGES, type Agenda, type Workflow} from '../../src/domain/model.ts';
 import {createAgendaFiles} from '../../src/ports/state.ts';
 import {git, remotePath, seedGitHub, withState, type SimState} from './github-sim.ts';
 import type {Expect, Scenario, TicketSpec} from './scenario.ts';
@@ -19,18 +19,25 @@ const REPO = {owner: 'sim', name: 'arena'};
 const KEY = `${REPO.owner}/${REPO.name}`;
 const DEADLINE_MS = 240_000;
 
+const judge = (role: string, agent = 'sim-seat') => ({role, agent, brief: `Judge as the ${role} seat.`});
+/** The built-in roster with every seat played by the scripted `sim-seat` agent. */
+const SIM_WORKFLOW: Workflow = {owner: {agent: 'sim-seat', brief: 'Deliver the ticket.'},
+  judges: {pullRequest: [judge('review'), judge('accept')], mergeCommit: [judge('postMerge')], parent: [judge('closure')]}};
+
 type Run = {
   name: string; dir: string; github: string; bin: string; work: string; data: string; mainSessions: string;
-  scenarioFile: string; scenario: Scenario; rootIssue: number; proc: Subprocess<'pipe', number, number> | null; starts: number;
+  scenarioFile: string; scenario: Scenario; workflow: Workflow; rootIssue: number; proc: Subprocess<'pipe', number, number> | null; starts: number;
 };
 type Case = {
   name: string;
+  /** The workflow the run's data directory supplies to convene; SIM_WORKFLOW when omitted. */
+  workflow?: Workflow;
   files: Record<string, string>;
   /** Issue titles in creation order; issue N is the Nth entry. The first may list children. */
   issues: {title: string; children?: number[]}[];
   requiredChecks: string[];
   ci: {default: SimState['ciDefault']; failMarker: string | null};
-  scenario: (markers: string) => Omit<Scenario, 'log' | 'repo' | 'name'>;
+  scenario: (markers: string) => Omit<Scenario, 'log' | 'repo' | 'name' | 'parentRoles'>;
   rootIssue: number;
   drive?: (run: Run) => Promise<void>;
   check: (run: Run) => Promise<string[]>;
@@ -40,17 +47,21 @@ type Case = {
 
 function setup(spec: Case): Run {
   const dir = mkdtempSync(`/tmp/rt-sim-${spec.name}-`);
-  const github = join(dir, 'github'), work = join(dir, 'work'), markers = join(dir, 'markers');
-  for (const path of [github, join(work, '.omp', 'agents'), markers, join(dir, 'data'), join(dir, 'main-sessions')]) mkdirSync(path, {recursive: true});
+  const github = join(dir, 'github'), work = join(dir, 'work'), markers = join(dir, 'markers'), data = join(dir, 'data');
+  for (const path of [github, join(work, '.omp', 'agents'), markers, data, join(dir, 'main-sessions')]) mkdirSync(path, {recursive: true});
   const bin = seedGitHub(github, {viewer: 'sim', ciDefault: spec.ci.default, ciFailMarker: spec.ci.failMarker,
     repos: [{...REPO, defaultBranch: 'main', requiredChecks: spec.requiredChecks, files: spec.files}],
     issues: spec.issues.map(issue => ({repo: KEY, title: issue.title, body: `Simulated ${issue.title}.`, ...(issue.children ? {children: issue.children} : {})}))});
-  writeFileSync(join(work, '.omp', 'agents', 'sim-seat.md'), '---\nname: sim-seat\ndescription: Scripted roundtable seat for the state-flow simulation\nmodel: sim/seat\n---\n\nFollow the roundtable brief.\n');
-  const scenario: Scenario = {name: spec.name, repo: REPO, log: join(dir, 'model.jsonl'), ...spec.scenario(markers)};
+  const workflow = spec.workflow ?? SIM_WORKFLOW;
+  // Every agent the workflow names is a scripted seat; the data directory's workflow.yml is the override convene reads (JSON is YAML).
+  for (const agent of new Set([workflow.owner.agent, ...JUDGE_STAGES.flatMap(stage => workflow.judges[stage].map(item => item.agent))]))
+    writeFileSync(join(work, '.omp', 'agents', `${agent}.md`), `---\nname: ${agent}\ndescription: Scripted roundtable seat for the state-flow simulation\nmodel: sim/seat\n---\n\nFollow the roundtable brief.\n`);
+  writeFileSync(join(data, 'workflow.yml'), JSON.stringify(workflow, null, 1));
+  const scenario: Scenario = {name: spec.name, repo: REPO, log: join(dir, 'model.jsonl'), parentRoles: workflow.judges.parent.map(item => item.role), ...spec.scenario(markers)};
   const scenarioFile = join(dir, 'scenario.json');
   writeFileSync(scenarioFile, JSON.stringify(scenario, null, 1));
   writeFileSync(scenario.log, '');
-  return {name: spec.name, dir, github, bin, work, data: join(dir, 'data'), mainSessions: join(dir, 'main-sessions'), scenarioFile, scenario, rootIssue: spec.rootIssue, proc: null, starts: 0};
+  return {name: spec.name, dir, github, bin, work, data, mainSessions: join(dir, 'main-sessions'), scenarioFile, scenario, workflow, rootIssue: spec.rootIssue, proc: null, starts: 0};
 }
 
 function start(run: Run): void {
@@ -59,8 +70,7 @@ function start(run: Run): void {
   run.proc = Bun.spawn(['omp', '--mode', 'rpc', '--no-ui', '--no-extensions', '-e', join(ROOT, 'index.ts'), '-e', join(ROOT, 'tests/sim/extension.ts'),
     '--model', 'sim/main', '--session-dir', run.mainSessions, '--roundtable', `${KEY}#${run.rootIssue}`], {
     cwd: run.work, stdin: 'pipe', stdout, stderr,
-    env: {...process.env, PATH: `${run.bin}:${process.env.PATH}`, OMP_ROUNDTABLE_DIR: run.data, OMP_ROUNDTABLE_OWNER_AGENT: 'sim-seat',
-      OMP_ROUNDTABLE_GATE_AGENT: 'sim-seat', OMP_ROUNDTABLE_RECOMPUTE_SECONDS: '1', SIM_SCENARIO: run.scenarioFile},
+    env: {...process.env, PATH: `${run.bin}:${process.env.PATH}`, OMP_ROUNDTABLE_DIR: run.data, OMP_ROUNDTABLE_RECOMPUTE_SECONDS: '1', SIM_SCENARIO: run.scenarioFile},
   });
   closeSync(stdout); closeSync(stderr);
 }
@@ -131,7 +141,7 @@ function seatSessions(run: Run, agendaId: string): SeatSession[] {
     const raw = readFileSync(join(dir, name), 'utf8');
     const lines = raw.split('\n').filter(Boolean).map(line => sessionLineSchema.parse(JSON.parse(line)));
     const header = lines.find(line => line.type === 'session');
-    const seat = /You are the (\w+) seat for roundtable ticket (\S+?)\. /.exec(raw);
+    const seat = /You are the ([\w-]+) seat for roundtable ticket (\S+?)\. /.exec(raw);
     return {file: join(dir, name), id: typeof header?.id === 'string' ? header.id : '', parent: typeof header?.parentSession === 'string' ? header.parentSession : null,
       role: seat?.[1] ?? '?', ticket: seat?.[2] ?? '?', lines};
   });
@@ -192,24 +202,25 @@ async function commonChecks(run: Run, expectOnMain: Expect): Promise<string[]> {
       if (input?.op === 'resolve' && input.ticketId) resolved.add(`${input.ticketId}:${input.revision}`);
     }
   }
-  // Gates judged the exact commit: review/accept sat on PR commits, postMerge on the merge commit.
+  // Judges judged the exact commit their stage names: pullRequest judges a PR commit, mergeCommit the merge commit, parent main.
   const sim = simState(run);
   const verdicts = acceptedVerdicts(seatSessions(run, state?.id ?? ''));
+  const roles = (stage: typeof JUDGE_STAGES[number]) => run.workflow.judges[stage].map(item => item.role);
   for (const ticket of run.scenario.tickets.filter(item => Object.keys(item.gate).length > 0))
-    for (const role of ['review', 'accept', 'postMerge']) if (!verdicts.some(verdict => verdict.ticket === ticket.id && verdict.role === role)) failures.push(`${ticket.id} has no accepted ${role} verdict in its transcripts`);
-  if (run.scenario.parent !== null && !verdicts.some(verdict => verdict.role === 'closure')) failures.push('no accepted closure verdict in the transcripts');
+    for (const role of [...roles('pullRequest'), ...roles('mergeCommit')]) if (!verdicts.some(verdict => verdict.ticket === ticket.id && verdict.role === role)) failures.push(`${ticket.id} has no accepted ${role} verdict in its transcripts`);
+  if (run.scenario.parent !== null) for (const role of roles('parent')) if (!verdicts.some(verdict => verdict.role === role)) failures.push(`no accepted ${role} closure verdict in the transcripts`);
   for (const verdict of verdicts) {
     const head = /HEAD ([0-9a-f]{40})/.exec(verdict.note)?.[1];
     if (!head) { failures.push(`${verdict.ticket} ${verdict.role} verdict has no observed HEAD`); continue; }
-    if (verdict.role === 'closure') {
-      if (gitIn(run, ['merge-base', '--is-ancestor', head, 'main']).code !== 0) failures.push(`closure sat on ${head}, which is not on main`);
+    if (roles('parent').includes(verdict.role)) {
+      if (gitIn(run, ['merge-base', '--is-ancestor', head, 'main']).code !== 0) failures.push(`${verdict.role} sat on ${head}, which is not on main`);
       continue;
     }
     const spec = run.scenario.tickets.find(ticket => ticket.id === verdict.ticket);
     const pr = sim.prs.find(item => item.state === 'MERGED' && spec && item.body.includes(`#${spec.issue}`));
     if (!pr?.mergeCommit) { failures.push(`${verdict.ticket} has no merged PR`); continue; }
-    if (verdict.role === 'postMerge') {
-      if (head !== pr.mergeCommit) failures.push(`${verdict.ticket} postMerge sat on ${head}, not merge ${pr.mergeCommit}`);
+    if (roles('mergeCommit').includes(verdict.role)) {
+      if (head !== pr.mergeCommit) failures.push(`${verdict.ticket} ${verdict.role} sat on ${head}, not merge ${pr.mergeCommit}`);
     } else if (gitIn(run, ['merge-base', '--is-ancestor', head, pr.lastHead]).code !== 0 || gitIn(run, ['merge-base', '--is-ancestor', head, `${pr.mergeCommit}^1`]).code === 0) {
       failures.push(`${verdict.ticket} ${verdict.role} sat on ${head}, which is not a commit of its PR`);
     }
@@ -309,7 +320,7 @@ const cases: Case[] = [
     async check(run) {
       const failures = await commonChecks(run, {'p.txt': '1\n', 'f.txt': '1\n'});
       const flips = z.array(z.object({sha: z.string(), at: z.number()})).parse(JSON.parse(readFileSync(join(run.dir, 'ci-flips.json'), 'utf8')));
-      for (const entry of modelLog(run).filter(item => item.kind === 'seat' && (item.role === 'review' || item.role === 'accept') && item.note === 'inspect')) {
+      for (const entry of modelLog(run).filter(item => item.kind === 'seat' && run.workflow.judges.pullRequest.some(judge => judge.role === item.role) && item.note === 'inspect')) {
         const flipped = flips.filter(flip => flip.at <= entry.at);
         if (!flipped.length) failures.push(`${entry.ticket} ${entry.role} started before any required check passed`);
       }
@@ -387,6 +398,8 @@ const cases: Case[] = [
         return ticket?.state === 'Coding' && ticket.revision >= 2 && modelLog(run).some(entry => entry.ticket === 'K' && entry.role === 'owner' && entry.note.startsWith('round 0 step 2'));
       });
       await kill(run);
+      // The resumed agenda keeps the roster it was convened with; a different file only shapes the next convene.
+      writeFileSync(join(run.data, 'workflow.yml'), JSON.stringify({...SIM_WORKFLOW, judges: {pullRequest: [judge('audit')], mergeCommit: [], parent: []}}));
       start(run);
       await waitUntil(run, 'completion after resume', completed);
     },
@@ -394,7 +407,10 @@ const cases: Case[] = [
       const failures = await commonChecks(run, {'k.txt': '1\n', 'k.verify': '1\n'});
       if (!modelLog(run).some(entry => entry.kind === 'main' && roundtableInput(entry)?.op === 'resume')) failures.push('Main did not resume the saved agenda');
       const state = await agenda(run);
-      const [source, fork] = owners(seatSessions(run, state!.id), 'K');
+      const sessions = seatSessions(run, state!.id);
+      if (sessions.some(session => session.role === 'audit')) failures.push('the resumed agenda seated a role from the rewritten workflow file');
+      if (JSON.stringify(state?.workflow) !== JSON.stringify(SIM_WORKFLOW)) failures.push(`the agenda workflow changed after resume: ${JSON.stringify(state?.workflow)}`);
+      const [source, fork] = owners(sessions, 'K');
       if (!source || !fork || fork.parent !== source.id) return [...failures, 'K rework Owner is not a fork of the interrupted Owner'];
       const message = (line: SeatSession['lines'][number]) => z.object({message: z.object({role: z.string(), content: z.unknown(), toolCallId: z.string().optional(), usage: z.object({cost: z.object({total: z.number()})}).optional()}).passthrough()}).safeParse(line);
       const sourceMessages = source.lines.filter(line => line.type === 'message').map(message).flatMap(item => item.success ? [item.data.message] : []);
@@ -408,6 +424,56 @@ const cases: Case[] = [
       const inherited = forkMessages.slice(0, continueAt).filter(item => item.role === 'assistant');
       if (!inherited.length || inherited.some(item => item.usage?.cost.total !== 0)) failures.push(`inherited assistant cost not reset: ${inherited.map(item => item.usage?.cost.total).join(',')}`);
       if (!sourceMessages.some(item => item.role === 'assistant' && (item.usage?.cost.total ?? 0) > 0)) failures.push('source Owner had no cost to reset');
+      return failures;
+    },
+  },
+  {
+    name: 'roster',
+    // Non-default seat names, a distinct agent and duty per seat, two PR judges, no merge-commit judge, two parent judges.
+    workflow: {owner: {agent: 'sim-owner', brief: 'OWNER-DUTY deliver the ticket.'}, judges: {
+      pullRequest: [{role: 'quality', agent: 'sim-quality', brief: 'QUALITY-DUTY judge the PR.'}, {role: 'security', agent: 'sim-security', brief: 'SECURITY-DUTY judge the PR.'}],
+      mergeCommit: [],
+      parent: [{role: 'release', agent: 'sim-release', brief: 'RELEASE-DUTY judge the parent.'}, {role: 'compliance', agent: 'sim-compliance', brief: 'COMPLIANCE-DUTY judge the parent.'}]}},
+    files: {'r1.txt': '0\n', 'r2.txt': '0\n'},
+    issues: [{title: 'Parent', children: [2, 3]}, {title: 'R1'}, {title: 'R2'}],
+    requiredChecks: [], ci: {default: 'SUCCESS', failMarker: null}, rootIssue: 1,
+    scenario: markers => ({parent: 1, closure: {'r1.txt': '1\n', 'r2.txt': '1\n'}, tickets: [
+      ticket('R1', 2, [commit({'r1.txt': '1\n'})], {'r1.txt': '1\n'}, {hold: {roles: ['security'], marker: join(markers, 'release-security')}}),
+      ticket('R2', 3, [commit({'r2.txt': '1\n'})], {'r2.txt': '1\n'}),
+    ]}),
+    async drive(run) {
+      // While security still holds, quality's pass alone must not let R1 merge.
+      await waitUntil(run, 'R1 quality passed while security holds', state => ticketOf(state, 'R1')?.gates.pullRequest?.verdicts.some(verdict => verdict.role === 'quality' && verdict.status === 'passed') ?? false);
+      const held = ticketOf(await agenda(run), 'R1');
+      const merged = simState(run).prs.some(pr => pr.state === 'MERGED' && pr.body.includes('#2'));
+      writeFileSync(join(run.dir, 'held.json'), JSON.stringify({state: held?.state, verdicts: held?.gates.pullRequest?.verdicts, merged}));
+      writeFileSync(join(run.dir, 'markers', 'release-security'), '');
+      await waitUntil(run, 'completion', completed);
+    },
+    async check(run) {
+      const failures = await commonChecks(run, {'r1.txt': '1\n', 'r2.txt': '1\n'});
+      const held = z.object({state: z.string().optional(), verdicts: z.array(z.object({role: z.string(), status: z.string()})).optional(), merged: z.boolean()}).parse(JSON.parse(readFileSync(join(run.dir, 'held.json'), 'utf8')));
+      if (held.state !== 'Reviewing' || held.merged || held.verdicts?.find(verdict => verdict.role === 'security')?.status !== 'pending') failures.push(`R1 advanced on one of two PR judges: ${JSON.stringify(held)}`);
+      const state = await agenda(run);
+      const seats: Record<string, {agent: string; duty: string}> = {owner: {agent: 'sim-owner', duty: 'OWNER-DUTY'}, quality: {agent: 'sim-quality', duty: 'QUALITY-DUTY'},
+        security: {agent: 'sim-security', duty: 'SECURITY-DUTY'}, release: {agent: 'sim-release', duty: 'RELEASE-DUTY'}, compliance: {agent: 'sim-compliance', duty: 'COMPLIANCE-DUTY'}};
+      const sessions = seatSessions(run, state!.id);
+      for (const role of Object.keys(seats)) if (!sessions.some(session => session.role === role)) failures.push(`no ${role} seat ran`);
+      for (const session of sessions) {
+        const seat = seats[session.role];
+        if (!seat) { failures.push(`${session.ticket} seated unconfigured role ${session.role}`); continue; }
+        const init = session.lines.find(line => line.type === 'session_init');
+        if (init?.agent !== seat.agent) failures.push(`${session.ticket} ${session.role} ran agent ${JSON.stringify(init?.agent)}, not ${seat.agent}`);
+        const raw = JSON.stringify(session.lines);
+        for (const [role, other] of Object.entries(seats)) if (raw.includes(other.duty) !== (role === session.role)) failures.push(`${session.ticket} ${session.role} brief ${role === session.role ? 'lacks its' : 'carries the'} ${other.duty}`);
+      }
+      // Without merge-commit judges each ticket still passes Verifying: its stage opened on the merge commit with no verdicts.
+      for (const id of ['R1', 'R2']) {
+        const ticket = ticketOf(state, id);
+        if (ticket?.state !== 'Done' || ticket.terminal?.kind !== 'merged' || ticket.gates.mergeCommit?.verdicts.length !== 0) failures.push(`${id} did not finish through an empty mergeCommit stage: ${JSON.stringify({state: ticket?.state, terminal: ticket?.terminal, mergeCommit: ticket?.gates.mergeCommit})}`);
+      }
+      const closure = state?.closure;
+      if (closure?.state !== 'Done' || closure.gate.verdicts.map(verdict => `${verdict.role}:${verdict.status}`).join(',') !== 'release:passed,compliance:passed') failures.push(`closure did not pass both parent judges: ${JSON.stringify(closure)}`);
       return failures;
     },
   },

@@ -18,7 +18,8 @@ export function buildPublicGrammar(z: PublicZ) {
   const prRefSchema = issueRefSchema;
   const shaRefSchema = object({repo:repoSchema,sha:shaSchema});
   const targetSchema = object({repo:repoSchema,base:text});
-  const roleSchema = z.enum(['owner','review','accept','postMerge','closure']);
+  /** A configured seat name; which names exist is decided by the agenda's frozen workflow, not by the grammar. */
+  const roleSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
   const entrySchema = object({id:idSchema,issue:issueRefSchema,target:targetSchema,dependsOn:z.array(idSchema),adoptPr:prRefSchema.nullable()});
   const conveneSchema = object({op:z.literal('convene'),parent:issueRefSchema.nullable(),tickets:z.array(entrySchema).min(1)});
   const actionSchema = z.union([
@@ -44,7 +45,7 @@ export function buildPublicGrammar(z: PublicZ) {
     object({op:z.literal('read'),ticketId:idSchema}),
     object({op:z.literal('launch'),ticketId:idSchema,role:roleSchema.optional()}),
     object({op:z.literal('submit'),ticketId:idSchema,revision,branch:text,head:shaSchema,title:text,body:text}),
-    object({op:z.literal('verdict'),ticketId:idSchema,revision,role:z.enum(['review','accept','postMerge','closure']),ok:z.boolean(),note:text}),
+    object({op:z.literal('verdict'),ticketId:idSchema,revision,role:roleSchema,ok:z.boolean(),note:text}),
     object({op:z.literal('escalate'),ticketId:idSchema,revision,kind:z.enum(['question','blocked','split','noCode']),reason:text}),
     resolveSchema,
     object({op:z.literal('finish'),summary:text}),

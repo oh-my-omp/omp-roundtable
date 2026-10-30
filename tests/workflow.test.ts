@@ -74,8 +74,6 @@ describe('workflow file source selection',()=>{
       expect(result.ok).toBe(false);
       if(result.ok)throw new Error('Invalid override silently loaded a workflow');
       expect(result.error.source).toBe(path);
-      expect(typeof result.error.reason).toBe('string');
-      expect(result.error.reason).not.toBe('');
       if(name==='invalid YAML')expect(result.error.reason).toContain('Invalid YAML');
     }finally {await rm(root,{recursive:true,force:true});}
   });

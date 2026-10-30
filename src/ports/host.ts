@@ -49,6 +49,14 @@ export function createHostPort(options:HostOptions):HostPort {
     if(!root?.session||root.kind!=='main'||root.status==='aborted')throw new Error('The native Main session is unavailable');
     return root.session;
   }
+  /** The definition a seat agent name resolves to in this workspace, as the native task tool would resolve it. */
+  async function seatAgent(parent:AgentSession,cwd:string,name:string){
+    const discovery=await discoverAgents(cwd,undefined,parent.effectiveExtensionRoots);
+    const agent=getAgent([...discovery.agents,...parent.getSessionAgents()],name);
+    if(!agent||cfgTaskDisabledAgents.get(parent.settings).includes(name))throw new Error(`Configured seat agent is unavailable: ${name}`);
+    if(agent.blocking)throw new Error(`Roundtable requires a nonblocking seat agent: ${name}`);
+    return agent;
+  }
   /**
    * A detached worktree of the repository's bare cache at exactly the commit the seat must build on or judge.
    * The cache is cloned once and fetched before every checkout; seats never clone from the network.
@@ -88,6 +96,13 @@ export function createHostPort(options:HostOptions):HostPort {
       if(!seat||seat.session!==ref.session||!file)return {ok:false,error:{kind:'precondition',message:'Caller is not a one-shot ticket seat'}};
       return {ok:true,value:{kind:'seat',agentId:ref.id,sessionId:ctx.sessionManager.getSessionId(),sessionFile:file,ticketId:seat.input.ticketId,revision:seat.input.revision,role:seat.input.role}};
     },
+    async agents(cwd,names){
+      try {
+        const parent=main();
+        for(const name of new Set(names))await seatAgent(parent,cwd,name);
+        return {ok:true,value:null};
+      }catch(error){return {ok:false,error:{kind:'precondition',message:error instanceof Error?error.message:String(error)}};}
+    },
     active(ticketId,role){return [...seats.values()].some(seat=>seat.input.ticketId===ticketId&&seat.input.role===role);},
     seated(ticketId,role,revision){return seatedRevisions.has(JSON.stringify([ticketId,role,revision]));},
     async launch(input){
@@ -103,10 +118,7 @@ export function createHostPort(options:HostOptions):HostPort {
         const parent=main();
         if(!parent.asyncJobManager)throw new Error('Roundtable requires the native async job manager');
         if(parent.getPlanModeState()?.enabled)throw new Error('Roundtable seats require an executing Main');
-        const discovery=await discoverAgents(input.cwd,undefined,parent.effectiveExtensionRoots);
-        const agent=getAgent([...discovery.agents,...parent.getSessionAgents()],input.agent);
-        if(!agent||cfgTaskDisabledAgents.get(parent.settings).includes(input.agent))throw new Error(`Configured seat agent is unavailable: ${input.agent}`);
-        if(agent.blocking)throw new Error('Roundtable requires a nonblocking seat agent');
+        const agent=await seatAgent(parent,input.cwd,input.agent);
         const sessionDir=join(sessionsDir,input.agendaId);
         await mkdir(sessionDir,{recursive:true,mode:0o700});
         let workspace:string;

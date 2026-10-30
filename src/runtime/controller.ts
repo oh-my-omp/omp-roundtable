@@ -1,16 +1,18 @@
 import {randomUUID} from 'node:crypto';
-import {SEAT_ROLES,type Agenda,type Caller,type DomainError,type Effect,type EffectResult,type Facts,type PortError,type PortInput,type Result,type Role} from '../domain/model.ts';
-import {abandonSeat,applyOperation,availableRoles,awaitsLaunch,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
+import {JUDGE_STAGES,type Agenda,type Caller,type DomainError,type Effect,type EffectResult,type Facts,type PortError,type PortInput,type Result,type Role,type Workflow} from '../domain/model.ts';
+import {abandonSeat,applyOperation,availableRoles,awaitsLaunch,closureRoles,confirmEffect,createAgenda,effectPrecondition,failEffect,reconcile,satisfiedResult} from '../domain/engine.ts';
 import {canonical,sameRef} from '../domain/identity.ts';
 import {seatBrief} from '../domain/briefs.ts';
-import type {AgendaFiles,GitHubPort,HostPort,SeatExit,SeatHandle,SeatLaunch,SeatWorkspace,StateError} from '../ports/contracts.ts';
+import {OWNER,parentSeatRoles,seatOf,ticketSeatRoles} from '../domain/workflow.ts';
+import type {AgendaFiles,GitHubPort,HostPort,SeatExit,SeatHandle,SeatLaunch,SeatWorkspace,StateError,WorkflowError} from '../ports/contracts.ts';
 import {createSourceReader,type SourceReceipt} from './source.ts';
 
-export type RuntimeError={kind:'domain';error:DomainError}|{kind:'storage';error:StateError}|{kind:'source'|'host';error:PortError};
+export type RuntimeError={kind:'domain';error:DomainError}|{kind:'storage';error:StateError}|{kind:'source'|'host';error:PortError}|{kind:'workflow';error:WorkflowError};
 /** Main's view: which tickets it may put on the table, and which seats the relay currently runs. */
 export type AgendaView={agenda:Agenda;launchable:string[];seated:{ticketId:string;roles:Role[]}[]};
 export type ControllerOutput=AgendaView|{active:string[]}|{ticket:Agenda['tickets'][number]|NonNullable<Agenda['closure']>}|{launched:SeatHandle[]};
-export type ControllerOptions={files:AgendaFiles;github:GitHubPort;host:HostPort;cwd:string;ownerAgent:string;gateAgent:string;intervalSeconds:number;onChange:()=>void;onError:(error:RuntimeError)=>void};
+/** `workflow` reads the workflow a new agenda will freeze; an attached agenda never consults it. */
+export type ControllerOptions={files:AgendaFiles;github:GitHubPort;host:HostPort;cwd:string;workflow:()=>Promise<Result<Workflow,WorkflowError>>;intervalSeconds:number;onChange:()=>void;onError:(error:RuntimeError)=>void};
 function domain(kind:DomainError['kind'],message:string):{ok:false;error:RuntimeError}{return {ok:false,error:{kind:'domain',error:{kind,message}}};}
 
 /** The controller is the sole writer of its agenda. GitHub observations are never optimistic writes. */
@@ -58,8 +60,9 @@ export class RoundtableController {
   private view():Result<ControllerOutput,RuntimeError> {
     if(!this.state)return domain('notFound','No agenda is attached');
     const state=this.state,host=this.options.host;
-    const seated=[...state.tickets.map(ticket=>ticket.id),...(state.closure?[state.closure.id]:[])]
-      .map(ticketId=>({ticketId,roles:SEAT_ROLES.filter(role=>host.active(ticketId,role))})).filter(item=>item.roles.length>0);
+    const ticketRoles=ticketSeatRoles(state.workflow),parentRoles=parentSeatRoles(state.workflow);
+    const seated=[...state.tickets.map(ticket=>({ticketId:ticket.id,roles:ticketRoles})),...(state.closure?[{ticketId:state.closure.id,roles:parentRoles}]:[])]
+      .map(({ticketId,roles})=>({ticketId,roles:roles.filter(role=>host.active(ticketId,role))})).filter(item=>item.roles.length>0);
     return {ok:true,value:{agenda:structuredClone(state),launchable:state.tickets.filter(ticket=>awaitsLaunch(state,ticket)).map(ticket=>ticket.id),seated}};
   }
   async startup(caller:Caller):Promise<Result<ControllerOutput,RuntimeError>> {
@@ -78,8 +81,12 @@ export class RoundtableController {
         const active=list.value.filter(state=>state.lifecycle==='active');
         if(operation.op==='convene'){
           if(active.length)return domain('ownershipBlocked','Resume the saved active agenda instead of creating a second owner');
+          const workflow=await this.options.workflow();if(!workflow.ok)return {ok:false,error:{kind:'workflow',error:workflow.error}};
+          // The workflow is frozen for the agenda's whole life, so a seat agent that cannot run is refused before it is.
+          const agents=await this.options.host.agents(this.options.cwd,[workflow.value.owner.agent,...JUDGE_STAGES.flatMap(stage=>workflow.value.judges[stage].map(judge=>judge.agent))]);
+          if(!agents.ok)return {ok:false,error:{kind:'host',error:agents.error}};
           const facts=await this.source.read(null,operation,'convene');if(!facts.ok)return {ok:false,error:{kind:'source',error:facts.error}};
-          const created=createAgenda(operation,facts.value,Date.now(),randomUUID());if(!created.ok)return {ok:false,error:{kind:'domain',error:created.error}};
+          const created=createAgenda(operation,workflow.value,facts.value,Date.now(),randomUUID());if(!created.ok)return {ok:false,error:{kind:'domain',error:created.error}};
           created.value.run={kind:'attached',id:this.runId,mainAgentId:caller.agentId,mainSessionId:caller.sessionId};
           const saved=await this.save(created.value,null);if(!saved.ok)return saved;
         }else{
@@ -106,8 +113,9 @@ export class RoundtableController {
       const settled=await this.settle(fresh.value);if(!settled.ok)return settled;
       if(operation.op==='finish'||operation.op==='resolve'&&operation.remove?.length){
         const retiring=operation.op==='finish'?this.state.tickets:this.state.tickets.filter(ticket=>operation.remove?.includes(ticket.id));
-        const live=retiring.some(ticket=>SEAT_ROLES.some(role=>this.options.host.active(ticket.id,role)));
-        if(live||operation.op==='finish'&&this.state.closure&&this.options.host.active(this.state.closure.id,'closure'))return domain('ownershipBlocked','Wait for retiring one-shot seat jobs to exit before finishing or removing their tickets');
+        const ticketRoles=ticketSeatRoles(this.state.workflow),closure=this.state.closure;
+        const live=retiring.some(ticket=>ticketRoles.some(role=>this.options.host.active(ticket.id,role)));
+        if(live||operation.op==='finish'&&closure&&parentSeatRoles(this.state.workflow).some(role=>this.options.host.active(closure.id,role)))return domain('ownershipBlocked','Wait for retiring one-shot seat jobs to exit before finishing or removing their tickets');
       }
       const changed=applyOperation(this.state,operation,caller,fresh.value,Date.now());if(!changed.ok)return {ok:false,error:{kind:'domain',error:changed.error}};
       if(operation.op==='finish'){
@@ -159,22 +167,30 @@ export class RoundtableController {
   /** The launch input of a due seat, or null when the agenda no longer offers that role. */
   private seatLaunch(ticketId:string,role:Role):SeatLaunch|null {
     const state=this.state;if(!state)return null;
+    const seat=seatOf(state.workflow,role);if(!seat)return null;
     const ticket=state.tickets.find(ticket=>ticket.id===ticketId),closure=state.closure?.id===ticketId?state.closure:null;
     let workspace:SeatWorkspace,revision:number;
     if(ticket){
       if(!availableRoles(state,ticket).includes(role))return null;
       revision=ticket.revision;
-      const stamp=role==='owner'||role==='closure'?null:ticket.gates[role]?.stamp;
-      // Gates judge exactly the PR head or merge commit their stamp names, never the target branch.
-      if(role==='owner')workspace=ticket.ownerSessionFile?{kind:'fork',sessionFile:ticket.ownerSessionFile}:{kind:'base',target:ticket.target};
-      else if((stamp?.kind==='review'||stamp?.kind==='accept')&&stamp.kind===role)workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.head,pull:stamp.pr.number};
-      else if(stamp?.kind==='postMerge'&&role==='postMerge')workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.commit,pull:null};
-      else return null;
-    }else if(closure&&role==='closure'&&closure.state==='Reviewing'&&closure.gate.status==='pending'){
+      // A judge's stage decides its checkout: exactly the PR head or merge commit its stage stamp names, never the target branch.
+      switch(seat.stage){
+        case 'owner':workspace=ticket.ownerSessionFile?{kind:'fork',sessionFile:ticket.ownerSessionFile}:{kind:'base',target:ticket.target};break;
+        case 'pullRequest':{
+          const stamp=ticket.gates.pullRequest?.stamp;if(!stamp)return null;
+          workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.head,pull:stamp.pr.number};break;
+        }
+        case 'mergeCommit':{
+          const stamp=ticket.gates.mergeCommit?.stamp;if(!stamp)return null;
+          workspace={kind:'commit',repo:stamp.target.repo,sha:stamp.commit,pull:null};break;
+        }
+        case 'parent':return null;
+      }
+    }else if(closure&&seat.stage==='parent'&&closureRoles(state).includes(role)){
       revision=closure.revision;workspace={kind:'base',target:state.tickets[0]!.target};
     }else return null;
-    return {agendaId:state.id,ticketId,revision,role,agent:role==='owner'?this.options.ownerAgent:this.options.gateAgent,cwd:this.options.cwd,
-      prompt:seatBrief(state,ticketId,role),ticket:ticket??closure!,workspace};
+    return {agendaId:state.id,ticketId,revision,role,agent:seat.agent,cwd:this.options.cwd,
+      prompt:seatBrief(state,ticketId,seat),ticket:ticket??closure!,workspace};
   }
   /**
    * Seats follow from ticket state alone: every started ticket and the parent closure receive their due seats
@@ -187,16 +203,16 @@ export class RoundtableController {
   private async relay():Promise<Result<SeatHandle[],RuntimeError>> {
     const launched:SeatHandle[]=[],host=this.options.host;
     if(this.closed||this.state?.lifecycle!=='active')return {ok:true,value:launched};
-    const due:{ticketId:string;role:Role}[]=[];
+    const due:{ticketId:string;role:Role}[]=[],ticketRoles=ticketSeatRoles(this.state.workflow);
     for(const ticket of this.state.tickets){
       if(!ticket.started)continue;
       for(const role of availableRoles(this.state,ticket)){
         if(host.seated(ticket.id,role,ticket.revision))continue;
-        if(role==='owner'?!SEAT_ROLES.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
+        if(role===OWNER?!ticketRoles.some(live=>host.active(ticket.id,live)):!host.active(ticket.id,role))due.push({ticketId:ticket.id,role});
       }
     }
     const closure=this.state.closure;
-    if(closure?.state==='Reviewing'&&closure.gate.status==='pending'&&!host.seated(closure.id,'closure',closure.revision)&&!host.active(closure.id,'closure'))due.push({ticketId:closure.id,role:'closure'});
+    if(closure)for(const role of closureRoles(this.state))if(!host.seated(closure.id,role,closure.revision)&&!host.active(closure.id,role))due.push({ticketId:closure.id,role});
     for(const {ticketId,role} of due){
       // An earlier failed launch may have escalated this ticket.
       const input=this.seatLaunch(ticketId,role);if(!input)continue;

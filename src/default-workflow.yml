@@ -1,0 +1,25 @@
+# Roundtable workflow: who works on a ticket and who judges each delivery stage.
+# The ticket states and GitHub effects are fixed; this file names the seats.
+# An agenda freezes the workflow it was convened with; edits apply to the next convene.
+owner:
+  agent: task:high
+  brief: Implement the issue contract and current Main rulings.
+judges:
+  # The open PR head once it is mergeable with passing required checks; every judge must pass before merging.
+  pullRequest:
+    - role: review
+      agent: task:mid
+      brief: Independently verify the complete current contract against this checkout, not just prior findings.
+    - role: accept
+      agent: task:mid
+      brief: Independently verify the complete current contract against this checkout, not just prior findings.
+  # The merge commit in the target; every judge must pass before the issue is closed.
+  mergeCommit:
+    - role: postMerge
+      agent: task:mid
+      brief: Independently verify the complete current contract against this checkout, not just prior findings.
+  # The target branch once every child ticket is delivered; every judge must pass before the parent is closed.
+  parent:
+    - role: closure
+      agent: task:mid
+      brief: Independently verify the complete current contract against this checkout, not just prior findings.

@@ -9,6 +9,7 @@ import {Attention} from './src/runtime/attention.ts';
 import {createAgendaFiles} from './src/ports/state.ts';
 import {createGitHubPort} from './src/ports/github.ts';
 import {createHostPort} from './src/ports/host.ts';
+import {loadWorkflow} from './src/ports/workflow.ts';
 import type {HostPort} from './src/ports/contracts.ts';
 import {coordinatorBriefing,parseCoordinatorFlag,type CoordinatorIdentity} from './src/runtime/coordinator.ts';
 import {RoundtableController,type RuntimeError} from './src/runtime/controller.ts';
@@ -22,8 +23,7 @@ function requireInterval(value:unknown):void {if(value!==undefined&&(typeof valu
 class ProcessRuntime {
   private readonly interval=register({id:'roundtable.recomputeIntervalSeconds',type:'number',default:120,env:'OMP_ROUNDTABLE_RECOMPUTE_SECONDS',validate:requireInterval});
   private readonly directory=register({id:'roundtable.dataDir',type:'string',default:join(getAgentDir(),'omp-roundtable'),env:'OMP_ROUNDTABLE_DIR',validate:requireText});
-  private readonly owner=register({id:'roundtable.ownerAgent',type:'string',default:'task:high',env:'OMP_ROUNDTABLE_OWNER_AGENT',validate:requireText});
-  private readonly gate=register({id:'roundtable.gateAgent',type:'string',default:'task:mid',env:'OMP_ROUNDTABLE_GATE_AGENT',validate:requireText});
+  private readonly workflowFile=register({id:'roundtable.workflowFile',type:'string',default:undefined,env:'OMP_ROUNDTABLE_WORKFLOW',validate:requireText});
   private identity:Identity|null=null;
   private binding:{pi:ExtensionAPI;ctx:ExtensionContext}|null=null;
   private controller:RoundtableController|null=null;
@@ -78,7 +78,10 @@ class ProcessRuntime {
       },
       onSeatError:(ticketId,message)=>this.report({kind:'host',error:{kind:'unavailable',message:`Ticket ${ticketId} seat: ${message}`}}),
     });
-    this.controller=new RoundtableController({files:createAgendaFiles(directory),github:createGitHubPort(),host:this.host,cwd:ctx.cwd,ownerAgent:this.owner.get(root.settings),gateAgent:this.gate.get(root.settings),intervalSeconds:this.interval.get(root.settings),onChange:()=>this.changed(),onError:error=>this.report(error)});
+    this.controller=new RoundtableController({files:createAgendaFiles(directory),github:createGitHubPort(),host:this.host,cwd:ctx.cwd,
+      // Read at each convene: a configured file must exist; otherwise the data directory may override the built-in workflow.
+      workflow:()=>{const file=this.workflowFile.get(root.settings);return loadWorkflow(file===undefined?{kind:'dataDir',path:join(directory,'workflow.yml')}:{kind:'configured',path:resolve(ctx.cwd,file)});},
+      intervalSeconds:this.interval.get(root.settings),onChange:()=>this.changed(),onError:error=>this.report(error)});
     const caller=this.host.bind(ctx);if(!caller.ok||caller.value.kind!=='main')throw new Error('Cannot bind Main to the coordinator');
     this.controller.setMain(caller.value);
     await pi.setActiveTools([...new Set([...pi.getActiveTools(),'roundtable'])]);

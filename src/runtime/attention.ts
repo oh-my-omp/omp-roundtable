@@ -1,5 +1,6 @@
-import {SEAT_ROLES,type Agenda,type Role} from '../domain/model.ts';
+import type {Agenda,Role} from '../domain/model.ts';
 import {awaitsLaunch} from '../domain/engine.ts';
+import {parentSeatRoles,ticketSeatRoles} from '../domain/workflow.ts';
 
 /**
  * The decisions only Main can make, one key each: a ticket it may put on the table, an Escalated ticket or
@@ -15,9 +16,11 @@ export function attentionKeys(agenda:Agenda,active:(ticketId:string,role:Role)=>
     if(ticket.state==='Escalated'&&!closing)keys.push(`escalated:${ticket.id}:${ticket.revision}`);
   }
   if(agenda.closure?.state==='Escalated')keys.push(`escalated:${agenda.closure.id}:${agenda.closure.revision}`);
-  const settled=agenda.tickets.every(ticket=>ticket.state==='Done')&&(!agenda.parent||agenda.closure?.state==='Done')
+  const ticketRoles=ticketSeatRoles(agenda.workflow),closure=agenda.closure;
+  const settled=agenda.tickets.every(ticket=>ticket.state==='Done')&&(!agenda.parent||closure?.state==='Done')
     &&agenda.effects.every(effect=>effect.state.kind==='confirmed'||effect.state.kind==='cancelled')
-    &&![...agenda.tickets.map(ticket=>ticket.id),...(agenda.closure?[agenda.closure.id]:[])].some(id=>SEAT_ROLES.some(role=>active(id,role)));
+    &&!agenda.tickets.some(ticket=>ticketRoles.some(role=>active(ticket.id,role)))
+    &&!(closure&&parentSeatRoles(agenda.workflow).some(role=>active(closure.id,role)));
   if(settled)keys.push('finish');
   return keys;
 }

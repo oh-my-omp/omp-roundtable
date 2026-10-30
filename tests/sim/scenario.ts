@@ -35,10 +35,10 @@ const ticketSpecSchema = z.object({
   dependsOn: z.array(z.string()),
   /** Owner behaviour per round; a round is one Owner handoff, or one seat that ended without a handoff. */
   owner: z.array(ownerRoundSchema).min(1),
-  /** review and accept pass only when the checkout matches; postMerge checks the same files. */
+  /** pullRequest and mergeCommit judges pass only when the checkout holds exactly these files. */
   gate: expectSchema,
-  /** Gates that wait for a marker file before inspecting their checkout. */
-  hold: z.object({roles: z.array(z.enum(['review', 'accept'])), marker: z.string()}).optional(),
+  /** Judges that wait for a marker file before inspecting their checkout. */
+  hold: z.object({roles: z.array(z.string()), marker: z.string()}).optional(),
   /** Main's rulings for this ticket's escalations, in order. */
   rulings: z.array(rulingSchema).optional(),
 });
@@ -49,8 +49,10 @@ export const scenarioSchema = z.object({
   repo: z.object({owner: z.string(), name: z.string()}),
   parent: z.number().int().nullable(),
   tickets: z.array(ticketSpecSchema),
-  /** The closure gate's expectation on the target branch. */
+  /** The parent-stage judges' expectation on the target branch. */
   closure: expectSchema,
+  /** The workflow's parent-stage judge roles; every other judge judges its own ticket. */
+  parentRoles: z.array(z.string()),
   /** JSON lines of every scripted model call, for the driver's assertions. */
   log: z.string(),
 });

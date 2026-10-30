@@ -21,8 +21,14 @@ export type ConveneInput = z.infer<typeof conveneSchema>;
 export type PortInput = z.infer<typeof portInputSchema>;
 export type ToolParameters = z.infer<typeof toolParametersSchema>;
 export type Role = z.infer<typeof roleSchema>;
-export type GateKind = Exclude<Role,'owner'>;
-export const SEAT_ROLES=['owner','review','accept','postMerge','closure'] as const satisfies readonly Role[];
+/** The judged stages of the fixed skeleton: the open PR before merge, the merge commit after it, and the parent closure. */
+export const JUDGE_STAGES=['pullRequest','mergeCommit','parent'] as const;
+export type JudgeStage = typeof JUDGE_STAGES[number];
+export const judgeSchema = object({role:roleSchema,agent:text,brief:text});
+export type Judge = z.infer<typeof judgeSchema>;
+/** Who works and who judges; frozen into each agenda at convene. */
+export const workflowSchema = object({owner:object({agent:text,brief:text}),judges:object({pullRequest:z.array(judgeSchema),mergeCommit:z.array(judgeSchema),parent:z.array(judgeSchema)})});
+export type Workflow = z.infer<typeof workflowSchema>;
 export type Action = z.infer<typeof actionSchema>;
 export const lifecycleEventSchema = object({ id: text, at: millisSchema });
 export type LifecycleEvent = z.infer<typeof lifecycleEventSchema>;
@@ -99,23 +105,29 @@ export const terminalSchema = z.union([
   object({kind:z.literal('noCode'),bodyHash:hashSchema,reason:text,at:millisSchema}),
 ]);
 export type Terminal = z.infer<typeof terminalSchema>;
-export const gateStampSchema = z.union([
-  object({kind:z.enum(['review','accept']),pr:prRefSchema,head:shaSchema,target:targetSchema,bodyHash:hashSchema,prBodyHash:hashSchema,contractRevision:revision,rulingsHash:hashSchema}),
-  object({kind:z.literal('postMerge'),issue:issueRefSchema,bodyHash:hashSchema,contractRevision:revision,terminal:terminalSchema,target:targetSchema,commit:shaSchema,rulingsHash:hashSchema}),
-  object({kind:z.literal('closure'),parent:issueRefSchema,bodyHash:hashSchema,children:z.array(object({id:idSchema,issue:issueRefSchema,terminal:terminalSchema})),targets:z.array(targetSchema),rulingsHash:hashSchema}),
-]);
-export type GateStamp = z.infer<typeof gateStampSchema>;
-export const gateRecordSchema = object({stamp:gateStampSchema,status:z.enum(['pending','passed','failed']),note:z.string()});
-export type GateRecord = z.infer<typeof gateRecordSchema>;
+export const pullRequestStampSchema = object({kind:z.literal('pullRequest'),pr:prRefSchema,head:shaSchema,target:targetSchema,bodyHash:hashSchema,prBodyHash:hashSchema,contractRevision:revision,rulingsHash:hashSchema});
+export type PullRequestStamp = z.infer<typeof pullRequestStampSchema>;
+export const mergeCommitStampSchema = object({kind:z.literal('mergeCommit'),issue:issueRefSchema,bodyHash:hashSchema,contractRevision:revision,terminal:terminalSchema,target:targetSchema,commit:shaSchema,rulingsHash:hashSchema});
+export type MergeCommitStamp = z.infer<typeof mergeCommitStampSchema>;
+export const parentStampSchema = object({kind:z.literal('parent'),parent:issueRefSchema,bodyHash:hashSchema,children:z.array(object({id:idSchema,issue:issueRefSchema,terminal:terminalSchema})),targets:z.array(targetSchema),rulingsHash:hashSchema});
+export type ParentStamp = z.infer<typeof parentStampSchema>;
+export const verdictSchema = object({role:roleSchema,status:z.enum(['pending','passed','failed']),note:z.string()});
+export type Verdict = z.infer<typeof verdictSchema>;
+/** One stage's judgment: the single fingerprint under judgment and one verdict per configured judge. */
+export const pullRequestGateSchema = object({stamp:pullRequestStampSchema,verdicts:z.array(verdictSchema)});
+export const mergeCommitGateSchema = object({stamp:mergeCommitStampSchema,verdicts:z.array(verdictSchema)});
+export const parentGateSchema = object({stamp:parentStampSchema,verdicts:z.array(verdictSchema)});
+export const noteAuthorSchema = z.union([object({kind:z.literal('seat'),role:roleSchema}),object({kind:z.literal('system')}),object({kind:z.literal('main')})]);
+export type NoteAuthor = z.infer<typeof noteAuthorSchema>;
 export const ticketSchema = object({
   id:idSchema,revision,issue:issueRefSchema,target:targetSchema,dependsOn:z.array(idSchema),
   contract:object({revision,bodyHash:hashSchema,body:z.string()}),
   state:z.enum(['Coding','Publishing','Reviewing','Merging','Verifying','Escalated','Done']),
   ownerSessionFile:text.nullable(),started:z.boolean(),
   pr:object({ref:prRefSchema.nullable(),headRepo:repoSchema,branch:text,head:shaSchema,title:text,body:z.string()}).nullable(),
-  gates:object({review:gateRecordSchema.nullable(),accept:gateRecordSchema.nullable(),postMerge:gateRecordSchema.nullable()}),
+  gates:object({pullRequest:pullRequestGateSchema.nullable(),mergeCommit:mergeCommitGateSchema.nullable()}),
   rulings:z.array(object({at:millisSchema,summary:text})),
-  notes:z.array(object({at:millisSchema,role:z.enum(['owner','review','accept','postMerge','system','main']),kind:z.enum(['finding','checks','conflict','escalation','sourceChange','ruling']),text})),
+  notes:z.array(object({at:millisSchema,author:noteAuthorSchema,kind:z.enum(['finding','checks','conflict','escalation','sourceChange','ruling']),text})),
   terminal:terminalSchema.nullable(),
 });
 export type Ticket = z.infer<typeof ticketSchema>;
@@ -137,9 +149,9 @@ export const effectSchema = object({id:idSchema,ticketId:idSchema,action:actionS
   object({kind:z.literal('cancelled'),reason:text}),
 ])});
 export type Effect = z.infer<typeof effectSchema>;
-export const closureSchema = object({id:idSchema,revision,gate:gateRecordSchema,state:z.enum(['Reviewing','Escalated','Done']),rulings:z.array(object({at:millisSchema,summary:text})),notes:z.array(text)});
+export const closureSchema = object({id:idSchema,revision,gate:parentGateSchema,state:z.enum(['Reviewing','Escalated','Done']),rulings:z.array(object({at:millisSchema,summary:text})),notes:z.array(text)});
 export type ClosureGate = z.infer<typeof closureSchema>;
-export const agendaSchema = object({id:agendaIdSchema,version:revision,nextId:revision,convenedAt:millisSchema,lifecycle:z.enum(['active','completed']),parent:issueRefSchema.nullable(),tickets:z.array(ticketSchema),closure:closureSchema.nullable(),effects:z.array(effectSchema),run:z.union([object({kind:z.literal('detached')}),object({kind:z.literal('attached'),id:idSchema,mainAgentId:text,mainSessionId:text})]),summary:text.nullable()});
+export const agendaSchema = object({id:agendaIdSchema,version:revision,nextId:revision,convenedAt:millisSchema,lifecycle:z.enum(['active','completed']),parent:issueRefSchema.nullable(),workflow:workflowSchema,tickets:z.array(ticketSchema),closure:closureSchema.nullable(),effects:z.array(effectSchema),run:z.union([object({kind:z.literal('detached')}),object({kind:z.literal('attached'),id:idSchema,mainAgentId:text,mainSessionId:text})]),summary:text.nullable()});
 export type Agenda = z.infer<typeof agendaSchema>;
 export type Caller = {agentId:string;sessionId:string;sessionFile:string|null;kind:'main'}|{agentId:string;sessionId:string;sessionFile:string;kind:'seat';ticketId:string;role:Role;revision:number};
 export type DomainError = {kind:'unauthorized'|'invalidTransition'|'staleRevision'|'sourceUnavailable'|'sourceChanged'|'notFound'|'ownershipBlocked'|'invalidTopology';message:string};

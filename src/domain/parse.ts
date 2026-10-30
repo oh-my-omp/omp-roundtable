@@ -1,5 +1,6 @@
 import type {ZodLikeSchema} from '@oh-my-pi/omptype/zod';
-import {agendaSchema,toolParametersSchema,type Agenda,type ParseError,type Result,type ToolParameters} from './model.ts';
+import {agendaSchema,toolParametersSchema,workflowSchema,type Agenda,type ParseError,type Result,type ToolParameters,type Workflow} from './model.ts';
+import {validateWorkflow,verdictsMatch} from './workflow.ts';
 
 function parse<T>(schema:ZodLikeSchema<T>,value:unknown):Result<T,ParseError> {
   const parsed=schema.safeParse(value);
@@ -8,6 +9,11 @@ function parse<T>(schema:ZodLikeSchema<T>,value:unknown):Result<T,ParseError> {
   return {ok:false,error:{path:first?.path.join('.')??'',reason:first?.message??'Invalid input'}};
 }
 export function parseToolParameters(value:unknown):Result<ToolParameters,ParseError>{return parse(toolParametersSchema,value);}
+export function parseWorkflow(value:unknown):Result<Workflow,ParseError> {
+  const parsed=parse(workflowSchema,value);if(!parsed.ok)return parsed;
+  const invalid=validateWorkflow(parsed.value);
+  return invalid?{ok:false,error:{path:'judges',reason:invalid}}:parsed;
+}
 
 /** Validate graph integrity at the file/input boundary, not at each internal read. */
 export function validateTopology(state:Pick<Agenda,'tickets'>):string|null {
@@ -39,5 +45,11 @@ export function parseAgenda(value:unknown):Result<Agenda,ParseError> {
   const ids=new Set(parsed.value.effects.map(effect=>effect.id));
   if(ids.size!==parsed.value.effects.length)return {ok:false,error:{path:'effects',reason:'Effect IDs must be unique'}};
   for(const effect of parsed.value.effects)if(!parsed.value.tickets.some(ticket=>ticket.id===effect.ticketId)&&effect.ticketId!==parsed.value.closure?.id)return {ok:false,error:{path:'effects',reason:'Effect must belong to a ticket or closure'}};
+  const workflow=parsed.value.workflow,invalid=validateWorkflow(workflow);
+  if(invalid)return {ok:false,error:{path:'workflow',reason:invalid}};
+  for(const ticket of parsed.value.tickets){
+    if(ticket.gates.pullRequest&&!verdictsMatch(workflow.judges.pullRequest,ticket.gates.pullRequest.verdicts)||ticket.gates.mergeCommit&&!verdictsMatch(workflow.judges.mergeCommit,ticket.gates.mergeCommit.verdicts))return {ok:false,error:{path:'tickets',reason:`Ticket ${ticket.id} verdicts do not match the agenda workflow`}};
+  }
+  if(parsed.value.closure&&!verdictsMatch(workflow.judges.parent,parsed.value.closure.gate.verdicts))return {ok:false,error:{path:'closure',reason:'Closure verdicts do not match the agenda workflow'}};
   return parsed;
 }
