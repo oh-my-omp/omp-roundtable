@@ -1,16 +1,18 @@
 import type {Result} from '../domain/model.ts';
 import {type LauncherStatus,installLauncher,launcherLogPaths,launcherStatus,uninstallLauncher} from './launch-agent.ts';
 import {LAUNCHER_PORT} from './link.ts';
+import {tr} from '../i18n.ts';
 
-export const LAUNCHER_USAGE='Usage: omp-roundtable-launcher install | uninstall | status';
+export function launcherUsage():string {return tr('Usage: omp-roundtable-launcher install | uninstall | status','用法：omp-roundtable-launcher install | uninstall | status');}
 
 export function describeLauncher(state:LauncherStatus):string {
   const logs=launcherLogPaths();
+  const yes=tr('yes','是'),no=tr('no','否');
   return [
-    `installed: ${state.installed?'yes':'no'} (${state.plist})`,
-    `launchd loaded: ${state.loaded?'yes':'no'}`,
-    `127.0.0.1:${LAUNCHER_PORT} answering: ${state.responding?'yes':'no'}`,
-    `logs: ${logs.out}, ${logs.err}`,
+    tr(`installed: ${state.installed?yes:no} (${state.plist})`,`已安装：${state.installed?yes:no}（${state.plist}）`),
+    tr(`launchd loaded: ${state.loaded?yes:no}`,`launchd 已加载：${state.loaded?yes:no}`),
+    tr(`127.0.0.1:${LAUNCHER_PORT} answering: ${state.responding?yes:no}`,`127.0.0.1:${LAUNCHER_PORT} 有响应：${state.responding?yes:no}`),
+    tr(`logs: ${logs.out}, ${logs.err}`,`日志：${logs.out}，${logs.err}`),
   ].join('\n');
 }
 
@@ -22,15 +24,15 @@ export async function launcherCommand(args:readonly string[]):Promise<Result<str
   const command=args[0]??'status';
   if(command==='install'){
     const result=await installLauncher();
-    return result.ok?{ok:true,value:`Roundtable launcher installed.\ninterpreter: ${result.value.interpreter}\n${describeLauncher(result.value.status)}`}:{ok:false,error:result.error.message};
+    return result.ok?{ok:true,value:`${tr('Roundtable launcher installed.','圆桌启动器已安装。')}\n${tr('interpreter:','解释器：')} ${result.value.interpreter}\n${describeLauncher(result.value.status)}`}:{ok:false,error:result.error.message};
   }
   if(command==='uninstall'){
     const result=await uninstallLauncher();
-    return result.ok?{ok:true,value:`Roundtable launcher uninstalled.\n${describeLauncher(result.value)}`}:{ok:false,error:result.error.message};
+    return result.ok?{ok:true,value:`${tr('Roundtable launcher uninstalled.','圆桌启动器已卸载。')}\n${describeLauncher(result.value)}`}:{ok:false,error:result.error.message};
   }
   if(command==='status'){
     const result=await launcherStatus();
     return result.ok?{ok:true,value:describeLauncher(result.value)}:{ok:false,error:result.error.message};
   }
-  return {ok:false,error:LAUNCHER_USAGE};
+  return {ok:false,error:launcherUsage()};
 }

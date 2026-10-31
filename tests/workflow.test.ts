@@ -62,7 +62,7 @@ describe('workflow validation',()=>{
     for(const text of [source+'extra: true\n',source.replace('  initial: Coding','  extra: true\n  initial: Coding'),source.replace('      role: owner','      extra: true\n      role: owner'),source.replace('        - role: review','        - extra: true\n          role: review')])expect(parseWorkflow(YAML.parse(text)).ok).toBe(false);
   });
   test('parseWorkflow rejects empty work and judge agents',()=>{
-    for(const name of ['task:high','task:mid'])expect(parseWorkflow(YAML.parse(source.replace(name,'""'))).ok).toBe(false);
+    for(const name of ['roundtable-owner','roundtable-reviewer'])expect(parseWorkflow(YAML.parse(source.replace(name,'""'))).ok).toBe(false);
   });
   test('parseWorkflow accepts empty judge states in both machines',()=>{
     const workflow=structuredClone(defaultWorkflow);

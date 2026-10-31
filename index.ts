@@ -9,21 +9,22 @@ import {Attention} from './src/runtime/attention.ts';
 import {createAgendaFiles} from './src/ports/state.ts';
 import {createGitHubPort} from './src/ports/github.ts';
 import {createHostPort} from './src/ports/host.ts';
-import {loadWorkflow} from './src/ports/workflow.ts';
+import {configuredWorkflow} from './src/ports/workflow-settings.ts';
+import {tr} from './src/i18n.ts';
+import {runtimeErrorText} from './src/runtime/error-text.ts';
 import type {HostPort} from './src/ports/contracts.ts';
 import {coordinatorBriefing,parseCoordinatorFlag,type CoordinatorIdentity} from './src/runtime/coordinator.ts';
 import {RoundtableController,type RuntimeError} from './src/runtime/controller.ts';
 
 const SLOT=Symbol.for('omp-roundtable.runtime.v4');
 type Identity={kind:'absent'}|{kind:'invalid';message:string}|({kind:'coordinator'}&CoordinatorIdentity);
-function requireText(value:unknown):void {if(value!==undefined&&(typeof value!=='string'||!value.trim()))throw new Error('Roundtable setting must be a nonempty string');}
-function requireInterval(value:unknown):void {if(value!==undefined&&(typeof value!=='number'||!Number.isSafeInteger(value)||value<1||value>2_147_483))throw new Error('Roundtable recompute interval must be positive whole seconds within the native timer range');}
+function requireText(value:unknown):void {if(value!==undefined&&(typeof value!=='string'||!value.trim()))throw new Error(tr('Roundtable setting must be a nonempty string','圆桌设置必须为非空字符串'));}
+function requireInterval(value:unknown):void {if(value!==undefined&&(typeof value!=='number'||!Number.isSafeInteger(value)||value<1||value>2_147_483))throw new Error(tr('Roundtable recompute interval must be positive whole seconds within the native timer range','圆桌重算间隔必须为原生定时器范围内的正整数秒'));}
 
 /** Main is one native session for the whole process; seats own their own SDK lifetimes. */
 class ProcessRuntime {
   private readonly interval=register({id:'roundtable.recomputeIntervalSeconds',type:'number',default:120,env:'OMP_ROUNDTABLE_RECOMPUTE_SECONDS',validate:requireInterval});
   private readonly directory=register({id:'roundtable.dataDir',type:'string',default:join(getAgentDir(),'omp-roundtable'),env:'OMP_ROUNDTABLE_DIR',validate:requireText});
-  private readonly workflowFile=register({id:'roundtable.workflowFile',type:'string',default:undefined,env:'OMP_ROUNDTABLE_WORKFLOW',validate:requireText});
   private identity:Identity|null=null;
   private binding:{pi:ExtensionAPI;ctx:ExtensionContext}|null=null;
   private controller:RoundtableController|null=null;
@@ -40,7 +41,7 @@ class ProcessRuntime {
   }
   private report(error:RuntimeError):void {
     logger.error('Roundtable runtime error',{error:JSON.stringify(error)});
-    this.binding?.ctx.ui.notify(`Roundtable: ${JSON.stringify(error)}`,'error');
+    this.binding?.ctx.ui.notify(runtimeErrorText(error),'error');
   }
   /**
    * Main wakes only for a decision still open when its turn ends: a launchable ticket, an Escalated ticket or
@@ -80,7 +81,7 @@ class ProcessRuntime {
     });
     this.controller=new RoundtableController({files:createAgendaFiles(directory),github:createGitHubPort(),host:this.host,cwd:ctx.cwd,
       // Read at each convene: a configured file must exist; otherwise the data directory may override the built-in workflow.
-      workflow:()=>{const file=this.workflowFile.get(root.settings);return loadWorkflow(file===undefined?{kind:'dataDir',path:join(directory,'workflow.yml')}:{kind:'configured',path:resolve(ctx.cwd,file)});},
+      workflow:()=>configuredWorkflow(ctx.cwd,directory),
       intervalSeconds:this.interval.get(root.settings),onChange:()=>this.changed(),onError:error=>this.report(error)});
     const caller=this.host.bind(ctx);if(!caller.ok||caller.value.kind!=='main')throw new Error('Cannot bind Main to the coordinator');
     this.controller.setMain(caller.value);
@@ -107,15 +108,15 @@ const slots=globalThis as typeof globalThis&{[SLOT]?:ProcessRuntime};
 
 export default function roundtable(pi:ExtensionAPI):void {
   const runtime=slots[SLOT]??(slots[SLOT]=new ProcessRuntime());
-  pi.registerFlag('roundtable',{description:'Start Main as coordinator for <owner>/<repo>#<number>',type:'string'});
-  pi.registerTool({name:'roundtable',label:'Roundtable',description:'Main coordinates a durable ticket graph and launches each ticket once; the roundtable then relays its seats until Done or Escalated. Seats read one ticket and hand off with submit/verdict/escalate. GitHub writes are performed and freshly confirmed by the state machine.',parameters:buildPublicGrammar(z).toolParametersSchema,defaultInactive:true,
+  pi.registerFlag('roundtable',{description:tr('Start Main as coordinator for <owner>/<repo>#<number>','将 Main 启动为 <owner>/<repo>#<number> 的协调者'),type:'string'});
+  pi.registerTool({name:'roundtable',label:tr('Roundtable','圆桌'),description:'Main coordinates a durable ticket graph and launches each ticket once; the roundtable then relays its seats until Done or Escalated. Seats read one ticket and hand off with submit/verdict/escalate. GitHub writes are performed and freshly confirmed by the state machine.',parameters:buildPublicGrammar(z).toolParametersSchema,defaultInactive:true,
     async execute(_id,params,_signal,_update,ctx){const response=await runtime.execute(ctx,params);return {content:[{type:'text',text:JSON.stringify(response)}],details:response,isError:!response.ok};},
   });
-  pi.registerCommand('roundtable-launcher',{description:'Install, uninstall, or inspect the local Roundtable link launcher (install|uninstall|status)',async handler(args,ctx){const result=await launcherCommand(args.trim().split(/\s+/).filter(part=>part.length>0));ctx.ui.notify(result.ok?result.value:result.error,result.ok?'info':'error');}});
+  pi.registerCommand('roundtable-launcher',{description:tr('Install, uninstall, or inspect the local Roundtable link launcher (install|uninstall|status)','安装、卸载或查看本地圆桌链接启动器（install|uninstall|status）'),async handler(args,ctx){const result=await launcherCommand(args.trim().split(/\s+/).filter(part=>part.length>0));ctx.ui.notify(result.ok?result.value:result.error,result.ok?'info':'error');}});
   pi.on('session_start',async(_event,ctx)=>{
     const identity=runtime.readIdentity(pi);
     if(identity.kind==='absent')return;
-    if(identity.kind==='invalid'){ctx.ui.notify(identity.message,'error');return;}
+    if(identity.kind==='invalid'){ctx.ui.notify(tr('--roundtable must carry a value of the form <owner>/<repo>#<number>','--roundtable 的值必须为 <owner>/<repo>#<number> 格式'),'error');return;}
     if(ctx.agent.id===MAIN_AGENT_ID&&ctx.agent.kind==='main')await runtime.start(pi,ctx,identity);
   });
   pi.on('agent_end',(_event,ctx)=>runtime.mainTurnEnded(ctx));

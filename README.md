@@ -36,7 +36,22 @@ Main starts a new agenda with `convene`, supplying `parent` (or `null`) and `tic
 
 ## Workflow
 
-Every ticket, and the parent closure once every ticket is delivered, moves through a state machine defined by the workflow. The workflow decides which states exist, what each one does, the condition for entering it, and where each outcome leads. Code fixes only what a state kind does and the source checks no workflow can switch off. The built-in workflow is [`src/default-workflow.yml`](src/default-workflow.yml). It runs `Coding → Publishing → AwaitingChecks → Reviewing → Merging → Verifying → Closing → Done`: the Owner on `task:high`, `review` and `accept` on the PR, `postMerge` on the merge commit, and `closure` on the parent on `task:mid`. Failing CI, a conflict, or a rejected review returns the ticket to `Coding`.
+Every ticket, and the parent closure once every ticket is delivered, moves through a state machine defined by the workflow. The workflow decides which states exist, what each one does, the condition for entering it, and where each outcome leads. Code fixes only what a state kind does and the source checks no workflow can switch off. The built-in workflow is [`src/default-workflow.yml`](src/default-workflow.yml). It runs `Coding → Publishing → AwaitingChecks → Reviewing → Merging → Verifying → Closing → Done`: the Owner uses the packaged `roundtable-owner` agent; `review` and `accept` on the PR, `postMerge` on the merge commit, and `closure` on the parent use the packaged `roundtable-reviewer` agent. Installing this plugin supplies both agents without omp-config. Failing CI, a conflict, or a rejected review returns the ticket to `Coding`.
+
+Neither packaged agent specifies a model. The host uses the current session model by default; bind models independently in the native `task.agentModelOverrides` setting, for example:
+
+```json
+{
+  "task": {
+    "agentModelOverrides": {
+      "roundtable-owner": "provider/owner-model",
+      "roundtable-reviewer": "provider/reviewer-model"
+    }
+  }
+}
+```
+
+Use valid model selectors from your host. To use other native agents, copy the built-in workflow to your own workflow file, change its `agent` names to agents discoverable in the coordinator's workspace, and select that file with `workflowFile` below. A workflow's duties (`brief`) remain separate from the agent's base responsibilities.
 
 | Kind | What it does | Outcomes |
 |---|---|---|
@@ -57,7 +72,7 @@ ticket:
   initial: Build
   adopted: {pullRequest: WaitCi, mergeCommit: Close}
   states:
-    Build: {kind: work, role: builder, agent: task:high, brief: Deliver the issue., on: {submitted: Open, escalated: escalate}}
+    Build: {kind: work, role: builder, agent: roundtable-owner, brief: Deliver the issue., on: {submitted: Open, escalated: escalate}}
     Open: {kind: action, action: publishPr, on: {done: WaitCi}}
     WaitCi:
       kind: decision
@@ -68,13 +83,13 @@ ticket:
       subject: pullRequest
       when: {not: {visits: {state: Build, atLeast: 2}}}
       otherwise: Quality
-      judges: [{role: security, agent: task:mid, brief: Check for injection and leaked secrets.}]
+      judges: [{role: security, agent: roundtable-reviewer, brief: Check for injection and leaked secrets.}]
       observe: {checksFailed: Build, conflict: Build, behind: Build, drift: WaitCi}
       on: {passed: Quality, rejected: escalate, escalated: escalate}
     Quality:
       kind: judge
       subject: pullRequest
-      judges: [{role: quality, agent: task:mid, brief: Check correctness and tests.}]
+      judges: [{role: quality, agent: roundtable-reviewer, brief: Check correctness and tests.}]
       observe: {checksFailed: Build, conflict: Build, behind: Build, drift: WaitCi}
       on: {passed: Ship, rejected: Build, escalated: escalate}
     Ship:
@@ -83,13 +98,13 @@ ticket:
       requires: [Quality]
       observe: {checksFailed: Build, conflict: Build, behind: Build}
       on: {done: [{when: {visits: {state: Build, atLeast: 2}}, to: Deploy}, {to: Close}]}
-    Deploy: {kind: judge, subject: mergeCommit, judges: [{role: deploy, agent: task:mid, brief: Verify the merged change.}], on: {passed: Close, rejected: escalate, escalated: escalate}}
+    Deploy: {kind: judge, subject: mergeCommit, judges: [{role: deploy, agent: roundtable-reviewer, brief: Verify the merged change.}], on: {passed: Close, rejected: escalate, escalated: escalate}}
     Close: {kind: action, action: closeIssue, on: {done: Delivered}}
     Delivered: {kind: final}
 parent:
   initial: Release
   states:
-    Release: {kind: judge, judges: [{role: release, agent: task:mid, brief: Verify the parent is delivered.}, {role: compliance, agent: task:mid, brief: Check the delivery against the release policy.}], on: {passed: CloseParent, rejected: escalate, escalated: escalate}}
+    Release: {kind: judge, judges: [{role: release, agent: roundtable-reviewer, brief: Verify the parent is delivered.}, {role: compliance, agent: roundtable-reviewer, brief: Check the delivery against the release policy.}], on: {passed: CloseParent, rejected: escalate, escalated: escalate}}
     CloseParent: {kind: action, action: closeParent, requires: [Release], on: {done: Finished}}
     Finished: {kind: final}
 ```
@@ -103,7 +118,23 @@ parent:
 
 The loader refuses unknown fields, unknown targets, unreachable states, cycles of entry fallbacks, an initial state that is not an unguarded `work` state, a machine without a final state, a parent condition that reads the PR, a judge role used twice or shared with a work role, a work role with two agents, a `requires` naming the wrong kind of judge, a missing outcome, and the reserved names `escalate` and `Escalated`. Role and state names start with a letter and use letters, digits, `_`, or `-`. A `brief` is the seat's duty. The roundtable adds the protocol to it: ticket scope, what the checkout is, the exact `submit` or `verdict` call, and that the workflow decides what follows. An `agent` is a native agent name, resolved the way `task` resolves it in the coordinator's `cwd`, and must be non-blocking.
 
-`convene` reads the workflow from `roundtable.workflowFile` (env `OMP_ROUNDTABLE_WORKFLOW`, relative to the coordinator's `cwd`), which must exist. When that setting is unset, it reads `<roundtable.dataDir>/workflow.yml`, falling back to the built-in workflow when the file does not exist. An unreadable or invalid file, or an agent that cannot host a seat, refuses `convene`. The agenda freezes the workflow it was convened with: relays, rework, and `resume` never read the file again, so edits apply to the next `convene`.
+`convene` reads the current `omp-roundtable` plugin setting `workflowFile`, relative to the coordinator's `cwd`; an explicitly selected file must exist. `OMP_ROUNDTABLE_WORKFLOW` takes precedence. Configure the global value with `/settings` → Plugins → omp-roundtable or `omp plugin config set omp-roundtable workflowFile ./workflow.yml`. Configure a project in `.omp/plugin-overrides.json`:
+
+```json
+{
+  "settings": {
+    "omp-roundtable": {
+      "workflowFile": "./workflow.yml"
+    }
+  }
+}
+```
+
+When neither the environment nor plugin setting selects a file, `convene` reads `<roundtable.dataDir>/workflow.yml`, falling back to the built-in workflow when the file does not exist. An unreadable or invalid file, an empty/non-string setting, or an agent that cannot host a seat refuses `convene`. The agenda freezes the workflow it was convened with: relays, rework, and `resume` never read the file again, so edits apply to the next `convene`. The existing `roundtable.dataDir` and `roundtable.recomputeIntervalSeconds` settings keep their native settings mechanism.
+
+## Interface language
+
+Notifications, command help, and the launcher CLI and HTML use English or Chinese. On each text generation, language is resolved from normalized `OMOMP_LANG=en|zh`, then the strict `omomp-lang: {language: en|zh}` section in exactly one `omomp.yml`, `omomp.yaml`, `omomp.json`, or `omomp.toml` in the agent directory, then the first nonempty `LC_ALL`, `LC_MESSAGES`, or `LANG` (`zh` prefix means Chinese), then English. The agent-directory section is read once per process; environment variables stay live. Ambiguous files or invalid sections are ignored. Model-facing tool descriptions, results, workflow briefs, and coordinator instructions stay English. Runtime notifications show a localized error category and point to the log for the full structured protocol diagnostic.
 
 ## Ticket handoff
 

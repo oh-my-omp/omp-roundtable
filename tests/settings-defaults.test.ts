@@ -12,6 +12,7 @@ describe('roundtable settings after extension load', () => {
 		roundtable(stubApi);
 		const settings = await Settings.init({inMemory: true, cwd: '/tmp'});
 		expect(() => lookup('roundtable.recomputeIntervalSeconds')!.override(settings, 0 as never)).toThrow();
-		expect(() => lookup('roundtable.workflowFile')!.override(settings, '   ' as never)).toThrow();
+		expect(() => lookup('roundtable.dataDir')!.override(settings, '   ' as never)).toThrow();
+		expect(lookup('roundtable.workflowFile')).toBeUndefined();
 	});
 });

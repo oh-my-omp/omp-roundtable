@@ -9,6 +9,7 @@ import {fileURLToPath} from 'node:url';
 import type {Result} from '../domain/model.ts';
 import {run} from './exec.ts';
 import {LAUNCHER_PORT} from './link.ts';
+import {diagnosticText} from './diagnostics.ts';
 
 export const LAUNCHER_LABEL='com.ohmyomp.roundtable-launcher';
 const cliPath=fileURLToPath(new URL('./cli.ts',import.meta.url));
@@ -87,17 +88,17 @@ async function status():Promise<LauncherStatus> {
 
 /** Idempotent: bootout first so a stale or differently configured agent is replaced. */
 export async function installLauncher():Promise<Result<LauncherReport,LauncherFailure>> {
-  if(process.platform!=='darwin')return failure('The launcher is installed as a macOS LaunchAgent; this host is not macOS');
+  if(process.platform!=='darwin')return failure(diagnosticText({kind:'notMac'}));
   const interpreter=interpreterOnPath();
-  if(!interpreter)return failure('Neither bun nor node answers on PATH, so the launcher has no interpreter to install');
+  if(!interpreter)return failure(diagnosticText({kind:'noInterpreter'}));
   await mkdir(dirname(plistPath),{recursive:true});
   await mkdir(dirname(logPath('out')),{recursive:true});
   await writeFile(plistPath,plistDocument(interpreter),'utf8');
   await run('launchctl',['bootout',launchctlTarget],{});
   const bootstrapped=await run('launchctl',['bootstrap',`gui/${process.getuid?.()??''}`,plistPath],{});
-  if(bootstrapped.code!==0)return failure(`launchctl bootstrap failed: ${bootstrapped.stderr.trim()||bootstrapped.stdout.trim()}`);
+  if(bootstrapped.code!==0)return failure(diagnosticText({kind:'bootstrap',detail:bootstrapped.stderr.trim()||bootstrapped.stdout.trim()}));
   const responding=await waitForPort();
-  if(!responding)return failure(`The LaunchAgent loaded but nothing answers on 127.0.0.1:${LAUNCHER_PORT}; see ${logPath('err')}`);
+  if(!responding)return failure(diagnosticText({kind:'notResponding',port:LAUNCHER_PORT,log:logPath('err')}));
   return {ok:true,value:{status:{plist:plistPath,installed:true,loaded:true,responding},interpreter}};
 }
 
@@ -105,7 +106,7 @@ export async function uninstallLauncher():Promise<Result<LauncherStatus,Launcher
   await run('launchctl',['bootout',launchctlTarget],{});
   await rm(plistPath,{force:true});
   const remaining=await status();
-  if(remaining.responding)return failure(`The LaunchAgent was removed but 127.0.0.1:${LAUNCHER_PORT} still answers; another launcher process is running`);
+  if(remaining.responding)return failure(diagnosticText({kind:'stillResponding',port:LAUNCHER_PORT}));
   return {ok:true,value:remaining};
 }
 

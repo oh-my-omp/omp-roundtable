@@ -1,6 +1,7 @@
 import {z} from '@oh-my-pi/omptype/zod';
 import {type Runner,run} from './exec.ts';
 import type {LaunchTarget} from './link.ts';
+import {diagnosticText} from './diagnostics.ts';
 
 /** `tern ls --json`, read only where a block can carry a coordinator command; every other field is ignored. */
 const listingSchema=z.object({
@@ -16,7 +17,7 @@ const inspectionSchema=z.object({clients:z.array(z.object({kind:z.string().optio
 
 export type LaunchOutcome={kind:'launched'}|{kind:'focused';block:string}|{kind:'frontendFailed';output:string};
 
-function describe(result:{code:number;stdout:string;stderr:string}):string {return result.stderr.trim()||result.stdout.trim()||`exit code ${result.code}`;}
+function describe(result:{code:number;stdout:string;stderr:string}):string {return result.stderr.trim()||result.stdout.trim()||diagnosticText({kind:'exitCode',code:result.code});}
 
 /** Tern launches every block as `<shell> -c "<command>"`, so one launcher argument arrives as a fragment of one array entry; compare whitespace-separated, unquoted tokens rather than raw entries. */
 function coordinatorTokens(args:readonly string[]):string[] {
@@ -68,7 +69,7 @@ export async function launch(target:LaunchTarget,exec:Runner=run):Promise<Launch
   let listing=await exec('tern',['ls','--json'],{});
   if(listing.code!==0||!connectedWindow(inspection.stdout)){
     const opened=await exec('tern',[target.cwd],{});
-    if(opened.code!==0)return {kind:'frontendFailed',output:`tern ${target.cwd} (no window): ${describe(opened)}`};
+    if(opened.code!==0)return {kind:'frontendFailed',output:diagnosticText({kind:'noWindow',cwd:target.cwd,detail:describe(opened)})};
     if(listing.code!==0)listing=await exec('tern',['ls','--json'],{});
   }
   if(listing.code!==0)return {kind:'frontendFailed',output:`tern ls: ${describe(listing)}`};

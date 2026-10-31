@@ -1,5 +1,6 @@
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {diagnosticText} from './diagnostics.ts';
 
 const runFile=promisify(execFile);
 const commandTimeoutMs=30_000;
@@ -16,7 +17,7 @@ export const run:Runner=async(command,args,options)=>{
     // Node's execFile rejects with an ExecFileException whose payload the bun
     // type surface does not expose here; read the fields it does carry.
     const failure=error as {code?:number|string;killed?:boolean;stdout?:string;stderr?:string;message?:string};
-    const message=failure.stderr?.trim()||(failure.killed===true?`${command} did not finish within ${commandTimeoutMs/1000} seconds`:'')||failure.message||'The command failed';
+    const message=failure.stderr?.trim()||(failure.killed===true?diagnosticText({kind:'timeout',command,seconds:commandTimeoutMs/1000}):'')||failure.message||diagnosticText({kind:'commandFailed'});
     return {code:typeof failure.code==='number'?failure.code:1,stdout:failure.stdout??'',stderr:message};
   }
 };

@@ -19,6 +19,7 @@ import {parseToolParameters} from '../domain/parse.ts';
 import type {Caller,PortInput,Repo,Result,Role} from '../domain/model.ts';
 import type {HostPort,SeatExit,SeatLaunch,SeatWorkspace} from './contracts.ts';
 import type {ControllerOutput,RuntimeError} from '../runtime/controller.ts';
+import {tr} from '../i18n.ts';
 
 const runFile=promisify(execFile);
 const contractSchema=z.object({systemPrompt:z.array(z.string()),tools:z.array(z.string()),mountedTools:z.array(z.string())}).strict();
@@ -148,7 +149,7 @@ export function createHostPort(options:HostOptions):HostPort {
         let handedOff=false;
         const caller:Caller={kind:'seat',agentId:id,sessionId:manager.getSessionId(),sessionFile,ticketId:input.ticketId,revision:input.revision,role:input.role};
         const nativeManager=manager;
-        const tool:ToolDefinition={name:'roundtable',label:'Roundtable',description:'Read or hand off only your bound ticket. A successful submit/verdict/escalate ends this seat.',parameters:buildPublicGrammar(z).toolParametersSchema,
+        const tool:ToolDefinition={name:'roundtable',label:tr('Roundtable','圆桌'),description:'Read or hand off only your bound ticket. A successful submit/verdict/escalate ends this seat.',parameters:buildPublicGrammar(z).toolParametersSchema,
             async execute(_id,params){
               if(handedOff)return {content:[{type:'text',text:'This seat has already handed off.'}],details:null,isError:true};
               const current=registry.get(id);

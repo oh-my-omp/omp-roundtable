@@ -2,6 +2,7 @@ import {stat} from 'node:fs/promises';
 import {isAbsolute} from 'node:path';
 import {parseIssueReference,refKey} from '../domain/identity.ts';
 import type {IssueRef,Result} from '../domain/model.ts';
+import {diagnosticText} from './diagnostics.ts';
 
 /**
  * Fixed by the published link contract. A configurable port would invalidate
@@ -28,12 +29,12 @@ export function isUserNavigation(navigation:{mode:string|undefined;user:string|u
 /** The link's path: `/<frontend>/<owner>/<repo>/issues/<number>`. */
 export function parseLinkPath(pathname:string):Result<IssueRef,Rejection> {
   const segments=pathname.split('/').filter(segment=>segment.length>0);
-  if(segments.length!==5)return refuse('The link path must be /<frontend>/<owner>/<repo>/issues/<number>');
+  if(segments.length!==5)return refuse(diagnosticText({kind:'linkPath'}));
   const [frontend,owner,repo,kind,number]=segments as [string,string,string,string,string];
-  if(frontend!=='tern')return refuse(`Unsupported frontend ${JSON.stringify(frontend)}; this launcher only serves tern`);
-  if(kind!=='issues')return refuse('The link path must end in /issues/<number>');
-  const issue=parseIssueReference(`${owner}/${repo}#${number}`);
-  return issue.ok?{ok:true,value:issue.value}:refuse(issue.error);
+  if(frontend!=='tern')return refuse(diagnosticText({kind:'frontend',frontend}));
+  if(kind!=='issues')return refuse(diagnosticText({kind:'issuePath'}));
+  const reference=`${owner}/${repo}#${number}`,issue=parseIssueReference(reference);
+  return issue.ok?{ok:true,value:issue.value}:refuse(diagnosticText({kind:'issueReference',value:reference}));
 }
 
 /**
@@ -47,9 +48,9 @@ export async function resolveTarget(input:{pathname:string;search:string}):Promi
   const path=parseLinkPath(input.pathname);
   if(!path.ok)return path;
   const cwd=new URLSearchParams(input.search).get('cwd');
-  if(cwd===null||cwd.length===0)return refuse('The link must carry cwd=<absolute path>');
-  if(!isAbsolute(cwd))return refuse(`cwd ${cwd} is not an absolute path`);
+  if(cwd===null||cwd.length===0)return refuse(diagnosticText({kind:'missingCwd'}));
+  if(!isAbsolute(cwd))return refuse(diagnosticText({kind:'relativeCwd',cwd}));
   const directory=await stat(cwd).catch(()=>null);
-  if(!directory?.isDirectory())return refuse(`cwd ${cwd} is not an existing directory`);
+  if(!directory?.isDirectory())return refuse(diagnosticText({kind:'missingDirectory',cwd}));
   return {ok:true,value:{frontend:'tern',issue:path.value,reference:refKey(path.value),cwd}};
 }
